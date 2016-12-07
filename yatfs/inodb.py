@@ -132,7 +132,7 @@ class InoDb(object):
                 to_set.append(("t_index", t_index))
         if not to_set:
             return
-        fields = [("%s = ?" % field) for field, _ in to_set]
+        fields = ", ".join([("%s = ?" % field) for field, _ in to_set])
         values = [value for _, value in to_set]
         values.append(ino)
         self.db.execute(
