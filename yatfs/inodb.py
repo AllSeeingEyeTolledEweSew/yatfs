@@ -2,6 +2,7 @@ import errno
 import logging
 import os
 import stat
+import sqlite3
 import threading
 import time
 
@@ -15,12 +16,10 @@ ROOT_INO = 1
 
 class InoDb(object):
 
-    def __init__(self, db):
-        self.db = db
+    def __init__(self, path):
+        self.path = path
 
         self._local = threading.local()
-
-        self._init()
 
     def __enter__(self):
         if not hasattr(self._local, "context_level"):
@@ -35,6 +34,21 @@ class InoDb(object):
         self._local.context_level -= 1
         if self._local.context_level == 0:
             self.db.__exit__(exc_type, exc_value, traceback)
+
+    @property
+    def db(self):
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            return db
+        if not os.path.exists(os.path.dirname(self.path)):
+            os.makedirs(os.path.dirname(self.path))
+        db = sqlite3.connect(self.path, isolation_level="IMMEDIATE")
+        self._local.db = db
+        db.row_factory = sqlite3.Row
+        db.text_factory = os.fsdecode
+        with db:
+            self._init()
+        return db
 
     def _init(self):
         self.db.execute(
@@ -314,14 +328,14 @@ class InoDb(object):
                 "left outer join dirent on st_ino = d_ino "
                 "where d_ino is null"):
             ino = row["st_ino"]
-            log().debug("orphan ino: %s", ino)
+            log().info("orphan ino: %s", ino)
             self.db.execute("delete from attr where st_ino = ?", (ino,))
         for row in self.db.execute(
                 "select d_parent, d_name from dirent "
                 "left outer join attr on d_ino = st_ino "
                 "where st_ino is null"):
             parent, name = row["d_parent"], row["d_name"]
-            log().debug("bogus dirent: %s in %s", parent, name)
+            log().info("bogus dirent: %s in %s", parent, name)
             self.db.execute(
                 "delete from dirent where d_parent = ? and d_name = ?",
                 (parent, name))

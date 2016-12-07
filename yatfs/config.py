@@ -32,22 +32,10 @@ class Config(object):
         return os.path.join(self.path, "files")
 
     @property
-    def db(self):
-        with self._lock:
-            if not self._db:
-                self._db = sqlite3.connect(
-                    self.db_path, check_same_thread=False,
-                    isolation_level="IMMEDIATE")
-                self._db.row_factory = sqlite3.Row
-                self._db.text_factory = os.fsdecode
-            return self._db
-
-    @property
     def inodb(self):
         with self._lock:
             if not self._inodb:
-                with self.db:
-                    self._inodb = inodb.InoDb(self.db)
+                self._inodb = inodb.InoDb(self.db_path)
             return self._inodb
 
     @property
