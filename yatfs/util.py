@@ -4,7 +4,9 @@ import hashlib
 
 def info_files(info):
     if b"files" in info:
-        return info[b"files"]
+        return [
+            {b"path": [info[b"name"]] + f[b"path"], b"length": f[b"length"]}
+            for f in info[b"files"]]
     else:
         return [{b"path": [info[b"name"]], b"length": info[b"length"]}]
 

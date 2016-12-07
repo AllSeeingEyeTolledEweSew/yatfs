@@ -289,6 +289,9 @@ class InoDb(object):
             "delete from dirent where d_parent = ? and d_name = ?",
             (parent, name))
         self.db.execute(
+            "update attr set st_nlink = st_nlink - 1 where st_ino = ?",
+            (parent,))
+        self.db.execute(
             "delete from dirent where d_parent = ?", (ino,))
         self.db.execute(
             "delete from attr where st_ino = ?", (ino,))
