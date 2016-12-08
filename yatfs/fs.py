@@ -154,6 +154,31 @@ class TorrentFs(fusell.FUSELL):
         else:
             self.reply_readdir(req, size, off, entries)
 
+    def symlink(self, req, link, parent, name):
+        log().debug("symlink(%s,%s,%s)", link, parent, name)
+        try:
+            ctx = self.req_ctx(req)
+            with self.inodb:
+                ino = self.inodb.symlink_ino(
+                    parent, name, link, ctx.uid, ctx.gid)
+            attr = self.inodb.getattr_ino(ino)
+            entry = dict(
+                ino=ino, attr=attr,
+                attr_timeout=self.attr_timeout,
+                entry_timeout=self.entry_timeout)
+        except:
+            self.catch(req, "symlink(%s,%s,%s)", link, parent, name)
+        else:
+            self.reply_entry(req, entry)
+
+    def readlink(self, req, ino):
+        try:
+            link = self.inodb.readlink_ino(ino)
+        except:
+            self.catch(req, "readlink(%s)", ino)
+        else:
+            self.reply_readlink(req, link)
+
     def listxattr(self, req, ino, size):
         log().debug("listxattr(%s)", ino)
         try:

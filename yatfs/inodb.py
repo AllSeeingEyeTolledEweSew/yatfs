@@ -53,25 +53,26 @@ class InoDb(object):
     def _init(self):
         self.db.execute(
             "create table if not exists attr ("
-            "  st_ino integer primary key,"
-            "  st_mode integer not null,"
-            "  st_nlink integer not null,"
-            "  st_uid integer not null,"
-            "  st_gid integer not null,"
-            "  st_size integer not null,"
-            "  st_atime integer not null,"
-            "  st_mtime integer not null,"
-            "  st_ctime integer not null,"
-            "  t_hash text,"
-            "  t_index integer)")
+            "st_ino integer primary key, "
+            "st_mode integer not null, "
+            "st_nlink integer not null, "
+            "st_uid integer not null, "
+            "st_gid integer not null, "
+            "st_size integer not null, "
+            "st_atime integer not null, "
+            "st_mtime integer not null, "
+            "st_ctime integer not null, "
+            "t_hash text, "
+            "t_index integer, "
+            "link text)")
         self.db.execute(
             "create index if not exists attr_hash "
             "on attr (t_hash)")
         self.db.execute(
             "create table if not exists dirent ("
-            "  d_parent integer not null,"
-            "  d_ino integer not null,"
-            "  d_name text not null)")
+            "d_parent integer not null, "
+            "d_ino integer not null, "
+            "d_name text not null)")
         self.db.execute(
             "create index if not exists dirent_parent "
             "on dirent (d_parent)")
@@ -198,15 +199,15 @@ class InoDb(object):
             (ino,))
 
     def _insert_ino(self, parent, name, mode, uid, gid, size,
-                   atime, mtime, ctime, hash=None, index=None):
+                    atime, mtime, ctime, hash=None, index=None, link=None):
         cur = self.db.cursor()
         cur.execute(
             "insert into attr "
             "  (st_mode, st_nlink, st_uid, st_gid, "
             "   st_size, st_atime, st_mtime, st_ctime, "
-            "   t_hash, t_index) "
-            "  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (mode, 0, uid, gid, size, atime, mtime, ctime, hash, index))
+            "   t_hash, t_index, link) "
+            "  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (mode, 0, uid, gid, size, atime, mtime, ctime, hash, index, link))
         ino = cur.lastrowid
         if stat.S_ISDIR(mode):
             self._insert_dirent(parent, name, ino)
@@ -215,11 +216,11 @@ class InoDb(object):
         return ino
 
     def _insert_helper(self, parent, name, mode, size, uid, gid,
-            hash=None, index=None):
+            hash=None, index=None, link=None):
         now = time.time()
         ino = self._insert_ino(
             parent, name, mode, uid, gid, size, now, now, now,
-            hash=hash, index=index)
+            hash=hash, index=index, link=link)
         return ino
 
     def mkdir_ino(self, parent, name, mode, uid, gid):
@@ -342,3 +343,21 @@ class InoDb(object):
             self.db.execute(
                 "delete from dirent where d_parent = ? and d_name = ?",
                 (parent, name))
+
+    def symlink_ino(self, parent, name, link, uid, gid):
+        return self._insert_helper(
+            parent, name, stat.S_IFLNK | 0o777, len(link), uid, gid,
+            link=link)
+
+    def symlink(self, path, link, uid, gid):
+        dirname, name = os.path.split(path)
+        return self.symlink_ino(self.lookup(dirname), name, link, uid, gid)
+
+    def readlink_ino(self, ino):
+        attr = self.getattr_ino(ino)
+        if not stat.S_ISLNK(attr["st_mode"]):
+            raise OSError(errno.EINVAL, "%s is not a symlink" % ino)
+        return attr["link"]
+
+    def readlink(self, path):
+        return self.readlink_ino(self.lookup(path))

@@ -55,6 +55,7 @@ class LibFUSE(CDLL):
         self.fuse_reply_err.argtypes = (fuse_req_t, c_int)
         self.fuse_reply_attr.argtypes = (fuse_req_t, c_void_p, c_double)
         self.fuse_reply_entry.argtypes = (fuse_req_t, c_void_p)
+        self.fuse_reply_readlink.argtypes = (fuse_req_t, c_char_p)
         self.fuse_reply_open.argtypes = (fuse_req_t, c_void_p)
         self.fuse_reply_buf.argtypes = (fuse_req_t, c_char_p, c_size_t)
         self.fuse_reply_write.argtypes = (fuse_req_t, c_size_t)
@@ -448,8 +449,8 @@ class FUSELL(object):
         st = dict_to_stat(attr)
         return self.libfuse.fuse_reply_attr(req, byref(st), c_double(attr_timeout))
 
-    def reply_readlink(self, req, *args):
-        pass    # XXX
+    def reply_readlink(self, req, link):
+        return self.libfuse.fuse_reply_readlink(req, link)
 
     def reply_open(self, req, fi=None):
         if fi:
