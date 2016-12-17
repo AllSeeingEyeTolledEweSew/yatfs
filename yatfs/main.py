@@ -3,10 +3,13 @@ import grp
 import logging
 import os
 import pwd
+import subprocess
 import sys
+import yaml
 
-from yatfs import config
+from yatfs import config as config_lib
 from yatfs import fs
+from yatfs import inodb
 from yatfs import util
 
 
@@ -14,9 +17,7 @@ class Command(object):
 
     def __init__(self, args):
         self.args = args
-        self.config_dir = self.args.config_dir
-        self.config = config.Config(self.config_dir)
-        self.inodb = self.config.inodb
+        self.inodb = inodb.InoDb(args.db_path)
 
     def get_uid_gid(self):
         if self.args.user is None:
@@ -44,6 +45,22 @@ class Command(object):
 class Mount(Command):
 
     def run(self):
+        if self.args.torrent_callback:
+            def get_torrent_data(hash):
+                p = subprocess.Popen(
+                    self.args.torrent_callback, stdout=subprocess.PIPE,
+                    shell=True, env={"HASH": hash})
+                stdout, _ = p.communicate()
+                return stdout
+        else:
+            assert self.args.torrent_dir
+            def get_torrent_data(hash):
+                path = os.path.join(
+                    self.args.torrent_dir, "%s.torrent" % hash)
+                with open(path, mode="rb") as f:
+                    return f.read()
+        self.config = config_lib.Config(
+            self.inodb, get_torrent_data, yaml.load(self.args.config))
         self.config.routine.run_loop_in_background()
         try:
             fs.TorrentFs(self.args.mountpoint, self.config)
@@ -106,11 +123,14 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Yet Another Torrent Filesystem")
-    parser.add_argument("--config_dir", required=True)
+    parser.add_argument("--db_path", required=True)
     subparsers = parser.add_subparsers(title="Commands")
 
     mount = subparsers.add_parser("mount")
     mount.set_defaults(command=Mount)
+    mount.add_argument("--torrent_dir")
+    mount.add_argument("--torrent_callback")
+    mount.add_argument("--config", required=True, type=argparse.FileType("r"))
     mount.add_argument("mountpoint")
 
     add_torrent_file = subparsers.add_parser("add_torrent_file")

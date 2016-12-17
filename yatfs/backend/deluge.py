@@ -102,7 +102,8 @@ class Torrent(object):
         if self.info_task.cancelled() or (
                 self.info_task.exception() is not None):
             return True
-        if self.loop.time() - self.info_time > self.config["info_cache_time"]:
+        if (self.loop.time() - self.info_time >
+                self.config.params["info_cache_time"]):
             return True
         return False
 
@@ -181,7 +182,7 @@ class Torrent(object):
         self.flushed_event_f = asyncio.Future(loop=self.loop)
         yield from self.client.call_async("pieceio.flush_cache", self.hash)
         yield from asyncio.wait_for(
-            self.flushed_event_f, self.config["cache_flush_timeout"],
+            self.flushed_event_f, self.config.params["cache_flush_timeout"],
             loop=self.loop)
 
     @asyncio.coroutine
@@ -196,7 +197,7 @@ class Torrent(object):
         while True:
             self.start_info_task()
             yield from asyncio.sleep(
-                self.config["info_poll_interval"], loop=self.loop)
+                self.config.params["info_poll_interval"], loop=self.loop)
 
     @asyncio.coroutine
     def ensure_piece_async(self, piece, timeout=None):
@@ -257,8 +258,8 @@ class Torrent(object):
         for p in lasts:
             lo = p + 1
             n = max(
-                self.config["readahead_pieces"],
-                self.config["readahead_bytes"] // piece_length)
+                self.config.params["readahead_pieces"],
+                self.config.params["readahead_bytes"] // piece_length)
             hi = min(num_pieces, lo + n)
             readahead.update(range(lo, hi))
 
@@ -374,7 +375,7 @@ class Backend(object):
                 self.server_info_task.exception() is not None):
             return True
         if (self.loop.time() - self.server_info_time >
-                self.config["server_info_cache_time"]):
+                self.config.params["server_info_cache_time"]):
             return True
         return False
 
@@ -464,7 +465,7 @@ class Backend(object):
         if self.torrents:
             close_redundant_connections = False
         elif self.last_release and (self.loop.time() - self.last_release <
-                self.config["peer_keepalive"]):
+                self.config.params["peer_keepalive"]):
             close_redundant_connections = False
         else:
             close_redundant_connections = True
@@ -488,7 +489,8 @@ class Backend(object):
         while True:
             self.start_server_info_task()
             yield from asyncio.sleep(
-                self.config["server_info_poll_interval"], loop=self.loop)
+                self.config.params["server_info_poll_interval"],
+                loop=self.loop)
 
     def init(self):
         return self.routine.call_in_loop(self.init_async())
@@ -575,4 +577,4 @@ class Backend(object):
     def read_async(self, hash, idx, offset, size, fh):
         yield from self.validate_server_info_async()
         return (yield from self.fis[fh].read_async(
-            offset, size, piece_timeout=self.config["piece_timeout"]))
+            offset, size, piece_timeout=self.config.params["piece_timeout"]))

@@ -27,7 +27,7 @@ class TorrentFs(fusell.FUSELL):
         self.inodb = self.config.inodb
         self.backend = self.config.backend
         super(TorrentFs, self).__init__(
-            mountpoint, fsname=self.config.db_path, subtype="yatfs")
+            mountpoint, fsname=self.config.inodb.path, subtype="yatfs")
 
     @property
     def entry_timeout(self):
