@@ -148,7 +148,7 @@ class Torrent(object):
             data = base64.b64encode(data)
             hash = yield from self.client.call_async(
                 "core.add_torrent_file", None, data, None)
-            assert hash.decode() == self.hash
+            assert hash is not None and hash.decode() == self.hash
             info = yield from self.fetch_info_async()
             yield from self.client.call_async(
                 "pieceio.prioritize_pieces", self.hash,
