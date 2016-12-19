@@ -1,9 +1,10 @@
 import argparse
+import functools
 import grp
 import logging
 import os
 import pwd
-import subprocess
+import re
 import sys
 import yaml
 
@@ -44,14 +45,20 @@ class Command(object):
 
 class Mount(Command):
 
+    EP_PATTERN = re.compile(
+        r"(?P<module>[\w.]+)\s*(:\s*(?P<attr>[\w.]+))?\s*$")
+
     def run(self):
         if self.args.torrent_callback:
+            m = self.EP_PATTERN.match(self.args.torrent_callback)
+            assert m, self.args.torrent_callback
+            module_name = m.group("module")
+            attrs = m.group("attr")
+            attrs = attrs.split(".") if attrs else []
             def get_torrent_data(hash):
-                p = subprocess.Popen(
-                    self.args.torrent_callback, stdout=subprocess.PIPE,
-                    shell=True, env={"HASH": hash})
-                stdout, _ = p.communicate()
-                return stdout
+                module = __import__(module_name, fromlist=["__name__"])
+                f = functools.reduce(getattr, attrs, module)
+                return f(hash)
         else:
             assert self.args.torrent_dir
             def get_torrent_data(hash):
