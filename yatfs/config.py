@@ -4,8 +4,8 @@ import threading
 import sqlite3
 import yaml
 
+import deluge_client_async
 from yatfs.backend import deluge as deluge_backend
-from yatfs.backend import deluge_client_async
 from yatfs import routine
 from yatfs import util
 
