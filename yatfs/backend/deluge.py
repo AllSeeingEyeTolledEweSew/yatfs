@@ -126,7 +126,7 @@ class Torrent(object):
                     self.info_task, loop=self.loop))
             except concurrent.futures.CancelledError:
                 # Task might have already been restarted.
-                if self.info_task.cancelled():
+                if self.info_task is None or self.info_task.cancelled():
                     self.start_info_task()
 
     @asyncio.coroutine
@@ -144,11 +144,16 @@ class Torrent(object):
         self.log_debug("update_info()")
         info = yield from self.fetch_info_async()
         while b"hash" not in info:
+            # Can happen while trying to reprioritize a closing torrent that
+            # never got added.
+            if not self.fis:
+                return None
             data = yield from self.config.get_torrent_data_async(self.hash)
             data = base64.b64encode(data)
             hash = yield from self.client.call_async(
                 "core.add_torrent_file", None, data, None)
-            assert hash is not None and hash.decode() == self.hash
+            assert hash is not None and hash.decode() == self.hash, (hash,
+                    self.hash)
             info = yield from self.fetch_info_async()
             yield from self.client.call_async(
                 "pieceio.prioritize_pieces", self.hash,
@@ -234,6 +239,10 @@ class Torrent(object):
     @asyncio.coroutine
     def prioritize_async(self):
         info = yield from self.get_info_async()
+        if info is None:
+            assert not self.fis, self.fis
+            return
+
         changes = []
 
         if not info[b"sequential_download"]:
