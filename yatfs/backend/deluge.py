@@ -5,11 +5,41 @@ import functools
 import logging
 import os
 
-from yatfs import util
-
 
 def log():
     return logging.getLogger(__name__)
+
+
+def file_range_split(info, idx, offset, size):
+    if b"files" in info:
+        for i in range(0, idx):
+            offset += info[b"files"][i][b"size"]
+        file_size = info[b"files"][idx][b"size"]
+    else:
+        assert idx == 0
+        file_size = info[b"length"]
+
+    size = min(size, file_size - offset)
+
+    if size <= 0:
+        return []
+
+    piece_length = info[b"piece_length"]
+    pieces = range(
+        int(offset // piece_length),
+        int((offset + size - 1) / piece_length) + 1)
+
+    split = []
+    for p in pieces:
+        piece_offset = p * piece_length
+        lo = offset - piece_offset
+        if lo < 0:
+            lo = 0
+        hi = offset - piece_offset + size
+        if hi > piece_length:
+            hi = piece_length
+        split.append((p, lo, hi))
+    return split
 
 
 class Bitfield(object):
@@ -342,7 +372,7 @@ class FileInfo(object):
     @asyncio.coroutine
     def read_async(self, offset, size, piece_timeout=None):
         info = yield from self.torrent.get_info_async()
-        split = util.file_range_split(info, self.idx, offset, size)
+        split = file_range_split(info, self.idx, offset, size)
         pieces = [p for p, lo, hi in split]
         self.last_read_pieces = set(pieces)
         self.torrent.prioritize()
@@ -355,7 +385,10 @@ class FileInfo(object):
 
 class Backend(object):
 
-    SESSION_SETTINGS = ("close_redundant_connections",)
+    SESSION_SETTINGS = (
+        "close_redundant_connections", "strict_end_game_mode",
+        "smooth_connects", "min_reconnect_time", "max_failcount",
+        "connection_speed", "connections_limit", "torrent_connect_boost")
 
     def __init__(self, client, config):
         self.client = client
@@ -444,50 +477,29 @@ class Backend(object):
         self.prioritize_task = self.loop.create_task(self.prioritize_async())
 
     @asyncio.coroutine
-    def force_close_redundant_connections_async(self):
-        status_dict = yield from self.client.call_async(
-            "core.get_torrents_status", {}, ("num_seeds", "state"))
-        to_force = []
-        for hash, status in status_dict.items():
-            if status[b"state"] == b"Seeding" and status[b"num_seeds"] > 0:
-                to_force.append(hash)
-        if not to_force:
-            return
-        while True:
-            try:
-                yield from self.client.call_async(
-                    "core.pause_torrent", to_force)
-                yield from self.client.call_async(
-                    "core.resume_torrent", to_force)
-            except concurrent.futures.CancelledError:
-                pass
-            else:
-                break
-
-    @asyncio.coroutine
     def prioritize_async(self):
         log().debug("prioritize")
         server_info = yield from self.get_server_info_async()
         if not server_info[b"session_settings"]:
             return
 
-        if self.torrents:
-            close_redundant_connections = False
-        elif self.last_release and (self.loop.time() - self.last_release <
-                self.config.params["peer_keepalive"]):
-            close_redundant_connections = False
-        else:
-            close_redundant_connections = True
+        desired_settings = {
+            b"close_redundant_connections": False,
+            b"strict_end_game_mode": False,
+            b"smooth_connects": False,
+            b"min_reconnect_time": 15,
+            b"max_failcount": 5,
+            b"connection_speed": 500,
+            b"connections_limit": 964,
+            b"torrent_connect_boost": 50,
+        }
 
         changes = []
 
-        if (server_info[b"session_settings"][b"close_redundant_connections"] !=
-                close_redundant_connections):
+        if (server_info[b"session_settings"] != desired_settings):
             changes.append(self.client.call_async(
                 "pieceio.session_set_settings",
-                close_redundant_connections=close_redundant_connections))
-            if close_redundant_connections:
-                changes.append(self.force_close_redundant_connections_async())
+                **{k.decode(): v for k, v in desired_settings.items()}))
 
         if changes:
             yield from asyncio.gather(*changes, loop=self.loop)
