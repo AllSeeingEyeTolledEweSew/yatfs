@@ -22,12 +22,13 @@ class TorrentFs(fusell.FUSELL):
         "user.index": "t_index",
     }
 
-    def __init__(self, mountpoint, config):
+    def __init__(self, mountpoint, config, **kwargs):
         self.config = config
         self.inodb = self.config.inodb
         self.backend = self.config.backend
         super(TorrentFs, self).__init__(
-            mountpoint, fsname=self.config.inodb.path, subtype="yatfs")
+            mountpoint, fsname=self.config.inodb.path, subtype="yatfs",
+            auto_unmount=True, **kwargs)
 
     @property
     def entry_timeout(self):

@@ -69,8 +69,15 @@ class Mount(Command):
         self.config = config_lib.Config(
             self.inodb, get_torrent_data, yaml.load(self.args.config))
         self.config.routine.run_loop_in_background()
+        options = {}
+        if self.args.default_permissions:
+            options["default_permissions"] = True
+        if self.args.allow_other:
+            options["allow_other"] = True
+        if self.args.allow_root:
+            options["allow_root"] = True
         try:
-            fs.TorrentFs(self.args.mountpoint, self.config)
+            fs.TorrentFs(self.args.mountpoint, self.config, **options)
         finally:
             self.config.routine.stop_loop()
 
@@ -138,6 +145,9 @@ def main():
     mount.add_argument("--torrent_dir")
     mount.add_argument("--torrent_callback")
     mount.add_argument("--config", required=True, type=argparse.FileType("r"))
+    mount.add_argument("--default_permissions", action="store_true")
+    mount.add_argument("--allow_other", action="store_true")
+    mount.add_argument("--allow_root", action="store_true")
     mount.add_argument("mountpoint")
 
     add_torrent_file = subparsers.add_parser("add_torrent_file")
