@@ -2,9 +2,10 @@ import errno
 import logging
 import os
 import stat
-import sqlite3
 import threading
 import time
+
+import apsw
 
 
 def log():
@@ -21,20 +22,6 @@ class InoDb(object):
 
         self._local = threading.local()
 
-    def __enter__(self):
-        if not hasattr(self._local, "context_level"):
-            self._local.context_level = 0
-        self._local.context_level += 1
-        if self._local.context_level == 1:
-            self._local.context = self.db.__enter__()
-        return self._local.context
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        assert self._local.context_level > 0
-        self._local.context_level -= 1
-        if self._local.context_level == 0:
-            self.db.__exit__(exc_type, exc_value, traceback)
-
     @property
     def db(self):
         db = getattr(self._local, "db", None)
@@ -42,65 +29,72 @@ class InoDb(object):
             return db
         if not os.path.exists(os.path.dirname(self.path)):
             os.makedirs(os.path.dirname(self.path))
-        db = sqlite3.connect(self.path, isolation_level="IMMEDIATE")
+        db = apsw.Connection(self.path)
+        db.setbusytimeout(5000)
         self._local.db = db
-        db.row_factory = sqlite3.Row
-        db.text_factory = os.fsdecode
-        with db:
-            self._init()
+        self._init()
         return db
 
     def _init(self):
-        self.db.execute(
-            "create table if not exists attr ("
-            "st_ino integer primary key, "
-            "st_mode integer not null, "
-            "st_nlink integer not null, "
-            "st_uid integer not null, "
-            "st_gid integer not null, "
-            "st_size integer not null, "
-            "st_atime integer not null, "
-            "st_mtime integer not null, "
-            "st_ctime integer not null, "
-            "t_hash text, "
-            "t_index integer, "
-            "link text)")
-        self.db.execute(
-            "create index if not exists attr_hash "
-            "on attr (t_hash)")
-        self.db.execute(
-            "create table if not exists dirent ("
-            "d_parent integer not null, "
-            "d_ino integer not null, "
-            "d_name text not null)")
-        self.db.execute(
-            "create index if not exists dirent_parent "
-            "on dirent (d_parent)")
-        self.db.execute(
-            "create unique index if not exists dirent_parent_name "
-            "on dirent (d_parent, d_name)")
-        now = time.time()
-        self.db.execute(
-            "insert or ignore into attr "
-            "  (st_ino, st_mode, st_nlink, st_uid, st_gid, "
-            "   st_size, st_atime, st_mtime, st_ctime) "
-            "  values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (ROOT_INO, stat.S_IFDIR | 0o555, 2, 0, 0, 0, now, now, now))
-        self.db.execute(
-            "insert or ignore into dirent (d_parent, d_ino, d_name) "
-            "values (?, ?, ?)",
-            (ROOT_INO, ROOT_INO, "."))
-        self.db.execute(
-            "insert or ignore into dirent (d_parent, d_ino, d_name) "
-            "values (?, ?, ?)",
-            (ROOT_INO, ROOT_INO, ".."))
+        with self.db:
+            c = self.db.cursor()
+            c.execute(
+                "create table if not exists attr ("
+                "st_ino integer primary key, "
+                "st_mode integer not null, "
+                "st_nlink integer not null, "
+                "st_uid integer not null, "
+                "st_gid integer not null, "
+                "st_size integer not null, "
+                "st_atime integer not null, "
+                "st_mtime integer not null, "
+                "st_ctime integer not null, "
+                "t_hash text, "
+                "t_index integer, "
+                "link text)")
+            c.execute(
+                "create index if not exists attr_hash "
+                "on attr (t_hash)")
+            c.execute(
+                "create table if not exists dirent ("
+                "d_parent integer not null, "
+                "d_ino integer not null, "
+                "d_name text not null)")
+            c.execute(
+                "create index if not exists dirent_parent "
+                "on dirent (d_parent)")
+            c.execute(
+                "create unique index if not exists dirent_parent_name "
+                "on dirent (d_parent, d_name)")
+            c.execute(
+                "create table if not exists global "
+                "(name text primary key, value blob) without rowid")
+            now = time.time()
+            c.execute(
+                "insert or ignore into attr "
+                "  (st_ino, st_mode, st_nlink, st_uid, st_gid, "
+                "   st_size, st_atime, st_mtime, st_ctime) "
+                "  values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ROOT_INO, stat.S_IFDIR | 0o555, 2, 0, 0, 0, now, now, now))
+            c.execute(
+                "insert or ignore into dirent (d_parent, d_ino, d_name) "
+                "values (?, ?, ?)",
+                (ROOT_INO, ROOT_INO, "."))
+            c.execute(
+                "insert or ignore into dirent (d_parent, d_ino, d_name) "
+                "values (?, ?, ?)",
+                (ROOT_INO, ROOT_INO, ".."))
+        c.execute("pragma journal_mode=wal")
 
     def getattr_ino(self, ino):
-        row = self.db.execute(
-            "select * from attr where st_ino = ?", (ino,)).fetchone()
+        c = self.db.cursor()
+        c.execute(
+            "select * from attr where st_ino = ?", (ino,))
+        desc = c.getdescription()
+        row = c.fetchone()
         if not row:
             raise OSError(errno.ENOENT, "no attr for %s" % ino)
-        return dict(row)
+        return dict(zip((name for name, type in desc), row))
 
     def getattr(self, path):
         return self.getattr_ino(self.lookup(path))
@@ -136,7 +130,7 @@ class InoDb(object):
         fields = ", ".join([("%s = ?" % field) for field, _ in to_set])
         values = [value for _, value in to_set]
         values.append(ino)
-        self.db.execute(
+        self.db.cursor().execute(
             "update attr set %s where st_ino = ?" % fields, values)
 
     def setattr(self, path, **kwargs):
@@ -145,61 +139,105 @@ class InoDb(object):
     def lookup_ino(self, parent, name):
         if not stat.S_ISDIR(self.getattr_ino(parent)["st_mode"]):
             raise OSError(errno.ENOTDIR, "%s not a directory" % parent)
-        row = self.db.execute(
+        row = self.db.cursor().execute(
             "select d_ino from dirent where d_parent = ? and d_name = ?",
             (parent, name)).fetchone()
         if not row:
             raise OSError(
                 errno.ENOENT, "no dirent for %s in %s" % (name, parent))
-        return row["d_ino"]
+        return row[0]
 
     def _split(self, path):
         assert path.startswith("/")
         path = path[1:]
         if path.endswith("/"):
             path = path[:-1]
-        return path.split("/") if path else ()
+        return path.split("/") if path else []
+
+    def lookup_full(self, path):
+        if path == "/":
+            yield (None, ROOT_INO)
+            return
+        split = [""] + self._split(path)
+        name_clauses = " ".join(
+            "when %(i)d then :n%(i)d" % {"i": i} for i in range(len(split)-1))
+        args = {"root": ROOT_INO, "rootmode": stat.S_IFDIR}
+        args.update({"n%d" % i: n for i, n in enumerate(split[1:])})
+        c = self.db.cursor().execute(
+            "with recursive path(name, ino, mode, level) as ("
+            "values(null, :root, :rootmode, 0) union "
+            "select dirent.d_name, dirent.d_ino, attr.st_mode, path.level + 1 "
+            "from path, dirent, attr "
+            "where dirent.d_parent = path.ino "
+            "and dirent.d_name = case level %(name_clauses)s end "
+            "and attr.st_ino = path.ino) "
+            "select name, ino, mode from path" %
+            {"name_clauses": name_clauses}, args)
+        num_rows = 0
+        last_ino = None
+        for name, ino, mode in c:
+            last_ino = ino
+            if num_rows < len(split) - 1 and not stat.S_ISDIR(mode):
+                raise OSError(errno.ENOTDIR, "%s not a directory" % ino)
+            yield (name, ino)
+            num_rows += 1
+        if num_rows != len(split):
+            raise OSError(
+                errno.ENOENT, "no dirent for %s in %s" %
+                (split[num_rows], last_ino))
+
+    def lookup_dirent(self, path):
+        parent = None
+        name = None
+        ino = None
+        for next_name, next_ino in self.lookup_full(path):
+            parent = ino
+            ino = next_ino
+            name = next_name
+        return (parent, name, ino)
 
     def lookup(self, path):
-        parent = None
-        ino = ROOT_INO
-        for name in self._split(path):
-            parent = ino
-            ino = self.lookup_ino(parent, name)
+        parent, name, ino = self.lookup_dirent(path)
         return ino
 
     def readdir_ino(self, ino):
-        rows = self.db.execute(
+        c = self.db.cursor().execute(
             "select d_name, d_ino from dirent where d_parent = ?", (ino,))
-        for row in rows:
-            yield (row["d_name"], self.getattr_ino(row["d_ino"]))
+        for name, ino in c:
+            yield (name, self.getattr_ino(ino))
 
     def readdir(self, path):
         for entry in self.readdir_ino(self.lookup(path)):
             yield entry
 
     def _insert_dirent(self, parent, name, ino):
-        row = self.db.execute(
+        row = self.db.cursor().execute(
             "select d_ino from dirent where d_parent = ? and d_name = ?",
             (parent, name)).fetchone()
         if row:
             raise OSError(
                 errno.EEXIST, "dirent exists: %s in %s" % (name, parent))
-        self.db.execute(
+        self.db.cursor().execute(
             "insert into dirent (d_parent, d_ino, d_name) "
             "values (?, ?, ?)", (parent, ino, name))
-        self.db.execute(
+        self.db.cursor().execute(
             "update attr set st_nlink = st_nlink + 1 where st_ino = ?",
             (parent,))
 
     def _insert_dirent_of_file(self, parent, name, ino):
         self._insert_dirent(parent, name, ino)
-        self.db.execute(
+        self.db.cursor().execute(
             "update attr set st_nlink = st_nlink + 1 where st_ino = ?",
             (ino,))
 
     def _insert_ino(self, parent, name, mode, uid, gid, size,
                     atime, mtime, ctime, hash=None, index=None, link=None):
+        row = self.db.cursor().execute(
+            "select d_ino from dirent where d_parent = ? and d_name = ?",
+            (parent, name)).fetchone()
+        if row:
+            raise OSError(
+                errno.EEXIST, "dirent exists: %s in %s" % (name, parent))
         cur = self.db.cursor()
         cur.execute(
             "insert into attr "
@@ -208,7 +246,7 @@ class InoDb(object):
             "   t_hash, t_index, link) "
             "  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (mode, 0, uid, gid, size, atime, mtime, ctime, hash, index, link))
-        ino = cur.lastrowid
+        ino = self.db.last_insert_rowid()
         if stat.S_ISDIR(mode):
             self._insert_dirent(parent, name, ino)
         else:
@@ -246,6 +284,7 @@ class InoDb(object):
                     ino = self.mkdir_ino(parent, name, mode, uid, gid)
                 else:
                     raise
+        return ino
 
     def mkfile_ino(self, parent, name, mode, hash, index, size,
                   uid, gid):
@@ -262,18 +301,19 @@ class InoDb(object):
         ino = self.lookup_ino(parent, name)
         if stat.S_ISDIR(self.getattr_ino(ino)["st_mode"]):
             raise OSError(errno.EISDIR, "%s in %s is dir" % (name, parent))
-        self.db.execute(
+        c = self.db.cursor()
+        c.execute(
             "delete from dirent where d_parent = ? and d_name = ?",
             (parent, name))
-        self.db.execute(
+        c.execute(
             "update attr set st_nlink = st_nlink - 1 where st_ino in (?, ?)",
             (parent, ino))
-        self.db.execute(
+        c.execute(
             "delete from attr where st_ino = ? and st_nlink = 0", (ino,))
 
     def unlink(self, path):
-        dirname, name = os.path.split(path)
-        return self.unlink_ino(self.lookup(dirname), name)
+        parent, name, _ = self.lookup_dirent(path)
+        return self.unlink_ino(parent, name)
 
     def rmdir_ino(self, parent, name):
         ino = self.lookup_ino(parent, name)
@@ -286,20 +326,19 @@ class InoDb(object):
         if attr["st_nlink"] > 2:
             raise OSError(errno.ENOTEMPTY, "%s in %s not empty" %
                     (name, parent))
-        self.db.execute(
+        c = self.db.cursor()
+        c.execute(
             "delete from dirent where d_parent = ? and d_name = ?",
             (parent, name))
-        self.db.execute(
+        c.execute(
             "update attr set st_nlink = st_nlink - 1 where st_ino = ?",
             (parent,))
-        self.db.execute(
-            "delete from dirent where d_parent = ?", (ino,))
-        self.db.execute(
-            "delete from attr where st_ino = ?", (ino,))
+        c.execute("delete from dirent where d_parent = ?", (ino,))
+        c.execute("delete from attr where st_ino = ?", (ino,))
 
     def rmdir(self, path):
-        dirname, name = os.path.split(path)
-        self.rmdir_ino(self.lookup(dirname), name)
+        parent, name, _ = self.lookup_dirent(path)
+        self.rmdir_ino(parent, name)
 
     def link_ino(self, ino, new_parent, new_name):
         attr = self.getattr_ino(ino)
@@ -313,34 +352,32 @@ class InoDb(object):
             self.lookup(old_path), self.lookup(new_dirname), new_name)
 
     def fsck(self):
-        for row in self.db.execute(
-                "select d_parent, count(*) as nlink from dirent "
-                "group by d_parent"):
-            self.db.execute(
+        for parent, nlink in self.db.cursor().execute(
+                "select d_parent, count(*) from dirent group by d_parent"):
+            self.db.cursor().execute(
                 "update attr set st_nlink = ? where st_ino = ?",
-                (row["nlink"], row["d_parent"]))
-        for row in self.db.execute(
-                "select d_ino, count(*) as nlink from dirent "
+                (nlink, parent))
+        for ino, nlink in self.db.cursor().execute(
+                "select d_ino, count(*) from dirent "
                 "inner join attr on st_ino = d_ino "
                 "where (st_mode & ?) = 0 "
                 "group by d_ino", (stat.S_IFDIR,)):
-            self.db.execute(
+            self.db.cursor().execute(
                 "update attr set st_nlink = ? where st_ino = ?",
-                (row["nlink"], row["d_ino"]))
-        for row in self.db.execute(
+                (nlink, ino))
+        for ino, in self.db.cursor().execute(
                 "select st_ino from attr "
                 "left outer join dirent on st_ino = d_ino "
                 "where d_ino is null"):
-            ino = row["st_ino"]
             log().info("orphan ino: %s", ino)
-            self.db.execute("delete from attr where st_ino = ?", (ino,))
-        for row in self.db.execute(
+            self.db.cursor().execute(
+                "delete from attr where st_ino = ?", (ino,))
+        for parent, name in self.db.cursor().execute(
                 "select d_parent, d_name from dirent "
                 "left outer join attr on d_ino = st_ino "
                 "where st_ino is null"):
-            parent, name = row["d_parent"], row["d_name"]
             log().info("bogus dirent: %s in %s", parent, name)
-            self.db.execute(
+            self.db.cursor().execute(
                 "delete from dirent where d_parent = ? and d_name = ?",
                 (parent, name))
 
@@ -361,3 +398,14 @@ class InoDb(object):
 
     def readlink(self, path):
         return self.readlink_ino(self.lookup(path))
+
+    def get_global(self, name):
+        row = self.db.cursor().execute(
+            "select value from global where name = ?", (name,)).fetchone()
+        if row:
+            return row[0]
+
+    def set_global(self, name, value):
+        self.db.cursor().execute(
+            "insert or replace into global (name, value) values (?, ?)",
+            (name, value))
