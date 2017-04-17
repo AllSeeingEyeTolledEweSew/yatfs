@@ -9,7 +9,7 @@ with open("README") as readme:
 
 setup(
     name="yatfs",
-    version="0.1.0",
+    version="0.1.1",
     description="FUSE-based torrent-backed filesystem",
     long_description=documentation,
     author="AllSeeingEyeTolledEweSew",
@@ -27,6 +27,5 @@ setup(
         "deluge-client-async>=0.1.0",
         "better-bencode>=0.2.1",
         "PyYAML>=3.12",
-        "apsw>=3.9.2",
     ],
 )
