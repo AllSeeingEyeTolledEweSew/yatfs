@@ -12,10 +12,11 @@ from yatfs import util
 
 class Config(object):
 
-    def __init__(self, inodb, get_torrent_data, params):
+    def __init__(self, inodb, get_torrent_data, params, args):
         self.inodb = inodb
         self.get_torrent_data = get_torrent_data
         self.params = params
+        self.args = args
 
         self._lock = threading.RLock()
         self._db = None
@@ -33,7 +34,11 @@ class Config(object):
     def backend(self):
         with self._lock:
             if not self._backend:
-                client = deluge_client_async.Client(loop=self.routine.loop)
+                client = deluge_client_async.Client(
+                    loop=self.routine.loop, host=self.args.deluge_host,
+                    port=self.args.deluge_port,
+                    username=self.args.deluge_username,
+                    password=self.args.deluge_password)
                 self._backend = deluge_backend.Backend(client, self)
             return self._backend
 

@@ -67,7 +67,8 @@ class Mount(Command):
                 with open(path, mode="rb") as f:
                     return f.read()
         self.config = config_lib.Config(
-            self.inodb, get_torrent_data, yaml.load(self.args.config))
+            self.inodb, get_torrent_data, yaml.load(self.args.config),
+            self.args)
         self.config.routine.run_loop_in_background()
         options = {}
         if self.args.default_permissions:
@@ -148,6 +149,10 @@ def main():
     mount.add_argument("--default_permissions", action="store_true")
     mount.add_argument("--allow_other", action="store_true")
     mount.add_argument("--allow_root", action="store_true")
+    mount.add_argument("--deluge_host")
+    mount.add_argument("--deluge_port", type=int)
+    mount.add_argument("--deluge_username")
+    mount.add_argument("--deluge_password")
     mount.add_argument("mountpoint")
 
     add_torrent_file = subparsers.add_parser("add_torrent_file")
