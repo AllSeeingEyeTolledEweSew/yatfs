@@ -9,7 +9,7 @@ with open("README") as readme:
 
 setup(
     name="yatfs",
-    version="0.1.1",
+    version="0.1.3",
     description="FUSE-based torrent-backed filesystem",
     long_description=documentation,
     author="AllSeeingEyeTolledEweSew",

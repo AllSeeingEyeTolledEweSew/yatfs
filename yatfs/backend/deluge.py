@@ -11,15 +11,18 @@ def log():
 
 
 def file_range_split(info, idx, offset, size):
+    offset_to_file = 0
     if b"files" in info:
         for i in range(0, idx):
-            offset += info[b"files"][i][b"size"]
+            offset_to_file += info[b"files"][i][b"size"]
         file_size = info[b"files"][idx][b"size"]
     else:
         assert idx == 0
         file_size = info[b"length"]
 
-    size = min(size, file_size - offset)
+    offset += offset_to_file
+
+    size = min(size, file_size - (offset - offset_to_file))
 
     if size <= 0:
         return []
@@ -466,7 +469,9 @@ class Backend(object):
     @asyncio.coroutine
     def validate_server_info_async(self):
         server_info = yield from self.get_server_info_async()
-        if server_info[b"lt_version"] != b"1.1.1.0":
+        lt_version = server_info[b"lt_version"]
+        lt_version = tuple(int(v) for v in lt_version.split(b"."))
+        if lt_version < (1, 1, 2, 0):
             raise OSError(errno.EIO, "wrong libtorrent version")
         if b"PieceIO" not in server_info[b"plugins"]:
             raise OSError(errno.EIO, "the PieceIO plugin is not enabled")
