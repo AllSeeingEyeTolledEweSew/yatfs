@@ -13,6 +13,9 @@ from yatfs import fs
 from yatfs import inodb
 from yatfs import util
 
+import apsw
+apsw.fork_checker()
+
 
 class Command(object):
 
