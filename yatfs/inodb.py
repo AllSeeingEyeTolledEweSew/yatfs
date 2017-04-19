@@ -21,6 +21,8 @@ class InoDb(object):
         self.path = path
 
         self._local = threading.local()
+        self._lock = threading.Lock()
+        self._initialized = False
 
     @property
     def db(self):
@@ -32,7 +34,10 @@ class InoDb(object):
         db = apsw.Connection(self.path)
         db.setbusytimeout(5000)
         self._local.db = db
-        self._init()
+        with self._lock:
+            if not self._initialized:
+                self._init()
+            self._initialized = True
         return db
 
     def _init(self):
