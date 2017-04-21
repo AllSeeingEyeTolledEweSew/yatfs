@@ -10,6 +10,14 @@ def log():
     return logging.getLogger(__name__)
 
 
+def completed_without_error(fut):
+    return fut.done() and not fut.cancelled() and not fut.exception()
+
+
+def completed_with_error(fut):
+    return fut.done() and (fut.cancelled() or fut.exception())
+
+
 def file_range_split(info, idx, offset, size):
     offset_to_file = 0
     if b"files" in info:
@@ -61,7 +69,7 @@ class Bitfield(object):
 
 class Info(dict):
 
-    def __init__(self, info, cache_status):
+    def __init__(self, info, cache_status, keep_redundant_connections):
         dict.__init__(self, info)
         self[b"piece_bitfield"] = Bitfield(self[b"piece_bitstring"])
         piece_to_write_cache = {}
@@ -69,6 +77,7 @@ class Info(dict):
             if cache_entry[b"kind"] == 1:
                 piece_to_write_cache[cache_entry[b"piece"]] = cache_entry
         self[b"piece_to_write_cache"] = piece_to_write_cache
+        self[b"keep_redundant_connections"] = keep_redundant_connections
 
     def have_piece(self, piece):
         return self[b"piece_bitfield"].get(piece)
@@ -102,8 +111,10 @@ class Torrent(object):
         self.flushed_event_f = None
         self.poll_task = None
         self.prioritize_task = None
+        self.dekeepalive_task = None
         self.piece_to_f = {}
         self.we_prioritized_piece = set()
+        self.last_release_time = None
 
     def log_debug(self, msg, *args):
         log().debug("%s: %s" % (self.hash, msg), *args)
@@ -111,7 +122,46 @@ class Torrent(object):
     def log_error(self, msg, *args):
         log().error("%s: %s" % (self.hash, msg), *args)
 
+    def log_exception(self, msg, *args):
+        log().exception("%s: %s" % (self.hash, msg), *args)
+
+    def should_keepalive(self):
+        if self.fis:
+            return True
+        if self.last_release_time is None:
+            return True
+        if (self.loop.time() - self.last_release_time <
+                self.config.params["keepalive"]):
+            return True
+        return False
+
+    def cleanup(self):
+        if self.fis:
+            return
+        if completed_with_error(self.prioritize_task):
+            try:
+                self.prioritize_task.result()
+            except:
+                self.log_exception("during cleanup prioritize")
+            self.prioritize()
+        if not self.should_keepalive():
+            if (not self.dekeepalive_task or
+                    completed_with_error(self.dekeepalive_task)):
+                self.dekeepalive()
+
+    def should_destroy(self):
+        if self.should_keepalive():
+            return False
+        if not completed_without_error(self.prioritize_task):
+            return False
+        if not self.dekeepalive_task:
+            return False
+        if not completed_without_error(self.dekeepalive_task):
+            return False
+        return True
+
     def destroy(self):
+        self.log_debug("destroy")
         if self.info_task:
             self.info_task.cancel()
         if self.flush_task:
@@ -120,6 +170,8 @@ class Torrent(object):
             self.poll_task.cancel()
         if self.prioritize_task:
             self.prioritize_task.cancel()
+        if self.dekeepalive_task:
+            self.dekeepalive_task.cancel()
         for future in self.piece_to_f.values():
             future.cancel()
         self.piece_to_f = {}
@@ -128,7 +180,7 @@ class Torrent(object):
         self.fis = {}
 
     def is_info_expired(self):
-        if not self.info_task:
+        if not self.info_task or not self.info_time:
             return True
         if not self.info_task.done():
             return False
@@ -173,6 +225,11 @@ class Torrent(object):
             "pieceio.get_cache_info", self.hash))
 
     @asyncio.coroutine
+    def fetch_keep_redundant_connections_async(self):
+        return (yield from self.client.call_async(
+            "pieceio.keep_redundant_connections", self.hash))
+
+    @asyncio.coroutine
     def do_get_info_async(self):
         self.log_debug("update_info()")
         info = yield from self.fetch_info_async()
@@ -194,8 +251,10 @@ class Torrent(object):
             self.we_prioritized_piece = set()
             info = yield from self.fetch_info_async()
         cache_status = yield from self.fetch_cache_status_async()
+        keep_redundant_connections = (
+            yield from self.fetch_keep_redundant_connections_async())
         self.info_time = self.loop.time()
-        info = Info(info, cache_status)
+        info = Info(info, cache_status, keep_redundant_connections)
         for piece, future in list(self.piece_to_f.items()):
             if info.have_piece(piece):
                 if not future.done():
@@ -264,6 +323,17 @@ class Torrent(object):
                 return
             yield from self.flush_cache_async()
 
+    def dekeepalive(self):
+        if self.dekeepalive_task:
+            self.dekeepalive_task.cancel()
+        self.dekeepalive_task = self.loop.create_task(self.dekeepalive_async())
+
+    @asyncio.coroutine
+    def dekeepalive_async(self):
+        self.log_debug("dekeepalive")
+        yield from self.client.call_async(
+            "pieceio.set_keep_redundant_connections", self.hash, False)
+
     def prioritize(self):
         if self.prioritize_task:
             self.prioritize_task.cancel()
@@ -330,6 +400,11 @@ class Torrent(object):
             changes.append(self.client.call_async(
                 "core.resume_torrent", [self.hash]))
 
+        if info[b"keep_redundant_connections"] != True:
+            changes.append(self.client.call_async(
+                "pieceio.set_keep_redundant_connections",
+                self.hash, True))
+
         if changes:
             yield from asyncio.gather(*changes, loop=self.loop)
             self.invalidate_info()
@@ -353,6 +428,7 @@ class FileInfo(object):
         log().debug("%s:%s: %s" % (self.torrent.hash, self.idx, msg), *args)
 
     def destroy(self):
+        self.log_debug("destroy")
         if self.file_task:
             self.file_task.cancel()
         self.file_task = None
@@ -389,9 +465,9 @@ class FileInfo(object):
 class Backend(object):
 
     SESSION_SETTINGS = (
-        "close_redundant_connections", "strict_end_game_mode",
-        "smooth_connects", "min_reconnect_time", "max_failcount",
-        "connection_speed", "connections_limit", "torrent_connect_boost")
+        "strict_end_game_mode", "smooth_connects", "min_reconnect_time",
+        "max_failcount", "connection_speed", "connections_limit",
+        "torrent_connect_boost")
 
     def __init__(self, client, config):
         self.client = client
@@ -414,11 +490,10 @@ class Backend(object):
     def is_server_info_expired(self):
         if not self.server_info_task:
             return True
-        if not self.server_info_task.done():
-            return False
-        if self.server_info_task.cancelled() or (
-                self.server_info_task.exception() is not None):
+        if completed_with_error(self.server_info_task):
             return True
+        if not completed_without_error(self.server_info_task):
+            return False
         if (self.loop.time() - self.server_info_time >
                 self.config.params["server_info_cache_time"]):
             return True
@@ -471,7 +546,7 @@ class Backend(object):
         server_info = yield from self.get_server_info_async()
         lt_version = server_info[b"lt_version"]
         lt_version = tuple(int(v) for v in lt_version.split(b"."))
-        if lt_version < (1, 1, 2, 0):
+        if lt_version < (1, 1, 3, 0):
             raise OSError(errno.EIO, "wrong libtorrent version")
         if b"PieceIO" not in server_info[b"plugins"]:
             raise OSError(errno.EIO, "the PieceIO plugin is not enabled")
@@ -489,7 +564,6 @@ class Backend(object):
             return
 
         desired_settings = {
-            b"close_redundant_connections": False,
             b"strict_end_game_mode": False,
             b"smooth_connects": False,
             b"min_reconnect_time": 15,
@@ -510,13 +584,24 @@ class Backend(object):
             yield from asyncio.gather(*changes, loop=self.loop)
             self.invalidate_server_info()
 
+    def cleanup(self):
+        for hash, torrent in list(self.torrents.items()):
+            torrent.cleanup()
+            if torrent.should_destroy():
+                torrent.destroy()
+                del self.torrents[hash]
+
     @asyncio.coroutine
     def poll_async(self):
         while True:
-            self.start_server_info_task()
-            yield from asyncio.sleep(
-                self.config.params["server_info_poll_interval"],
-                loop=self.loop)
+            try:
+                self.start_server_info_task()
+                self.cleanup()
+                yield from asyncio.sleep(
+                    self.config.params["server_info_poll_interval"],
+                    loop=self.loop)
+            except:
+                log().exception("during server poll")
 
     def init(self):
         return self.routine.call_in_loop(self.init_async())
@@ -553,6 +638,7 @@ class Backend(object):
         if hash not in self.torrents:
             self.torrents[hash] = Torrent(self, hash)
         torrent = self.torrents[hash]
+        torrent.last_release_time = None
         fi = FileInfo(torrent, file_index)
         torrent.fis[fh] = fi
         self.fis[fh] = fi
@@ -567,7 +653,6 @@ class Backend(object):
         log().debug("release(%s,%s)", hash, file_index)
         self.last_release = self.loop.time()
         destroy_fi = None
-        destroy_torrent = None
         if fh in self.fis:
             destroy_fi = self.fis.pop(fh)
         if hash in self.torrents:
@@ -575,8 +660,7 @@ class Backend(object):
             if fh in torrent.fis:
                 del torrent.fis[fh]
             if not torrent.fis:
-                destroy_torrent = torrent
-                del self.torrents[hash]
+                torrent.last_release_time = self.loop.time()
             if torrent.prioritize_task:
                 torrent.prioritize_task.cancel()
             torrent.prioritize()
@@ -586,8 +670,6 @@ class Backend(object):
                 pass
         if destroy_fi:
             destroy_fi.destroy()
-        if destroy_torrent:
-            destroy_torrent.destroy()
 
     def on_cache_flushed(self, hash):
         hash = hash.decode()
