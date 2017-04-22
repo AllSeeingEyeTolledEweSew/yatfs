@@ -250,9 +250,10 @@ class Torrent(object):
                 [0] * info[b"num_pieces"])
             self.we_prioritized_piece = set()
             info = yield from self.fetch_info_async()
-        cache_status = yield from self.fetch_cache_status_async()
-        keep_redundant_connections = (
-            yield from self.fetch_keep_redundant_connections_async())
+        cache_status, keep_redundant_connections = yield from asyncio.gather(
+            self.fetch_cache_status_async(),
+            self.fetch_keep_redundant_connections_async(),
+            loop=self.loop)
         self.info_time = self.loop.time()
         info = Info(info, cache_status, keep_redundant_connections)
         for piece, future in list(self.piece_to_f.items()):
