@@ -256,6 +256,10 @@ class Torrent(object):
             loop=self.loop)
         self.info_time = self.loop.time()
         info = Info(info, cache_status, keep_redundant_connections)
+        outstanding = [
+            p for p in range(0, info[b"num_pieces"])
+            if info[b"piece_priorities"][p] != 0 and not info.have_piece(p)]
+        self.log_debug("outstanding: %s", outstanding)
         for piece, future in list(self.piece_to_f.items()):
             if info.have_piece(piece):
                 if not future.done():
@@ -356,25 +360,21 @@ class Torrent(object):
         num_pieces = info[b"num_pieces"]
         piece_length = info[b"piece_length"]
         piece_priorities = list(info[b"piece_priorities"])
+        readahead_bytes = max(
+            self.config.params["readahead_pieces"] * piece_length,
+            self.config.params["readahead_bytes"])
 
         desired_priorities = { p: 0 for p in range(num_pieces) }
-        lasts = set()
         reading_now = set()
         readahead = set()
 
         for fi in self.fis.values():
-            pieces = fi.last_read_pieces
-            reading_now.update(pieces)
-            if pieces:
-                lasts.add(max(pieces))
-
-        for p in lasts:
-            lo = p + 1
-            n = max(
-                self.config.params["readahead_pieces"],
-                self.config.params["readahead_bytes"] // piece_length)
-            hi = min(num_pieces, lo + n)
-            readahead.update(range(lo, hi))
+            if fi.last_read_end is None:
+                continue
+            reading_now.update(fi.last_read_pieces)
+            split = file_range_split(
+                info, fi.idx, fi.last_read_end, readahead_bytes)
+            readahead.update(p for p, lo, hi in split)
 
         desired_priorities.update({ p: 4 for p in readahead })
         desired_priorities.update({ p: 7 for p in reading_now })
@@ -424,6 +424,7 @@ class FileInfo(object):
 
         self.file_task = None
         self.last_read_pieces = ()
+        self.last_read_end = None
 
     def log_debug(self, msg, *args):
         log().debug("%s:%s: %s" % (self.torrent.hash, self.idx, msg), *args)
@@ -455,6 +456,7 @@ class FileInfo(object):
         split = file_range_split(info, self.idx, offset, size)
         pieces = [p for p, lo, hi in split]
         self.last_read_pieces = set(pieces)
+        self.last_read_end = offset + size
         self.torrent.prioritize()
         yield from self.torrent.ensure_pieces_on_disk_async(
             pieces, timeout=piece_timeout)
