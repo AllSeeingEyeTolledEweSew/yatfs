@@ -9,7 +9,7 @@ with open("README") as readme:
 
 setup(
     name="yatfs",
-    version="0.1.6",
+    version="0.4.0",
     description="FUSE-based torrent-backed filesystem",
     long_description=documentation,
     author="AllSeeingEyeTolledEweSew",
@@ -17,15 +17,17 @@ setup(
     url="http://github.com/AllSeeingEyeTolledEweSew/yatfs",
     license="Unlicense",
     packages=find_packages(),
+    use_2to3=True,
     entry_points={
         "console_scripts": [
             "yatfs = yatfs.main:main"
         ]
     },
-    python_requires=">=3.4",
     install_requires=[
-        "deluge-client-async>=0.1.0",
+        "deluge-client-sync>=0.1.0",
         "better-bencode>=0.2.1",
         "PyYAML>=3.12",
+	"llfuse>=1.3,<2.0",
+	"btn>=0.1.2",
     ],
 )
