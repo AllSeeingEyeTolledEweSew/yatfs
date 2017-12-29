@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 
 import better_bencode
 import concurrent.futures
@@ -14,17 +15,20 @@ import deluge_client_sync
 from yatfs import fs
 
 
+DEFAULT_KEY = "yatfs"
 DEFAULT_KEEPALIVE = 60
 DEFAULT_READ_TIMEOUT = 60
 DEFAULT_READAHEAD_PIECES = 4
 DEFAULT_READAHEAD_BYTES = 0x2000000
+DEFAULT_READAHEAD_PRIORITY = 4
+DEFAULT_READING_PRIORITY = 7
 
 
 def log():
     return logging.getLogger(__name__)
 
 
-def file_range_pieces(info, idx, offset, size_bytes, size_pieces):
+def file_range_split(info, idx, offset, size):
     offset_to_file = 0
     if b"files" in info:
         for i in range(0, idx):
@@ -36,45 +40,42 @@ def file_range_pieces(info, idx, offset, size_bytes, size_pieces):
 
     offset += offset_to_file
 
-    piece_length = info[b"piece_length"]
-    first_piece = int(offset // piece_length)
+    size = min(size, file_size - (offset - offset_to_file))
 
-    size_bytes = min(size_bytes, file_size - (offset - offset_to_file))
-
-    if size_bytes <= 0 and size_pieces <= 0:
+    if size <= 0:
         return []
 
-    piece_max = int((offset + size_bytes - 1) / piece_length) + 1
-    piece_max = max(piece_max, first_piece + size_pieces)
+    piece_length = info[b"piece_length"]
+    pieces = range(
+        int(offset // piece_length),
+        int((offset + size - 1) / piece_length) + 1)
 
-    return list(range(first_piece, piece_max))
+    split = []
+    for p in pieces:
+        piece_offset = p * piece_length
+        lo = offset - piece_offset
+        if lo < 0:
+            lo = 0
+        hi = offset - piece_offset + size
+        if hi > piece_length:
+            hi = piece_length
+        split.append((p, lo, hi))
+    return split
 
 
 class Info(dict):
-
-    def __init__(self, info):
-        dict.__init__(self, info)
-        piece_to_write_cache = {}
-        for cache_entry in self.get(b"cache_status", {}).get(b"pieces", []):
-            if cache_entry[b"kind"] == 1:
-                piece_to_write_cache[cache_entry[b"piece"]] = cache_entry
-        self[b"piece_to_write_cache"] = piece_to_write_cache
 
     def have_piece(self, i):
         if i >> 3 >= len(self.get(b"piece_bitfield", b"")):
             return False
         return bool(self[b"piece_bitfield"][i >> 3] & (0x80 >> (i & 7)))
 
-    def piece_on_disk(self, piece):
-        return (
-            self.have_piece(piece) and
-            piece not in self[b"piece_to_write_cache"])
-
 
 class Backend(object):
 
-    def __init__(self, client, keepalive=None, read_timeout=None,
-                 readahead_pieces=None, readahead_bytes=None):
+    def __init__(self, client, key=None, keepalive=None, read_timeout=None,
+                 readahead_pieces=None, readahead_bytes=None,
+                 readahead_priority=None, reading_priority=None):
         self.client = client
         self.keepalive = float(keepalive or DEFAULT_KEEPALIVE)
         self.read_timeout = float(read_timeout or DEFAULT_READ_TIMEOUT)
@@ -82,11 +83,19 @@ class Backend(object):
             readahead_pieces or DEFAULT_READAHEAD_PIECES)
         self.readahead_bytes = int(
             readahead_bytes or DEFAULT_READAHEAD_BYTES)
+        self.key = key or DEFAULT_KEY
+        self.readahead_priority = int(
+            readahead_priority or DEFAULT_READAHEAD_PRIORITY)
+        self.reading_priority = int(
+            reading_priority or DEFAULT_READING_PRIORITY)
 
         self.lock = threading.RLock()
         self.torrents = {}
         self.initialized = False
         self.shutdown = None
+
+    def key_prefix(self):
+        return self.key + "_"
 
     def open(self, inode, flags):
         with self.lock:
@@ -115,11 +124,11 @@ class Backend(object):
             updater.start()
 
         self.client.add_event_handler(
-            "TorrentAddedEvent", self.on_torrent_add)
+            b"TorrentAddedEvent", self.on_torrent_add)
         self.client.add_event_handler(
-            "TorrentRemovedEvent", self.on_torrent_remove)
+            b"TorrentRemovedEvent", self.on_torrent_remove)
         self.client.add_event_handler(
-            "CacheFlushedEvent", self.on_cache_flush)
+            b"ReadPieceEvent", self.on_read_piece)
 
     def destroy(self):
         with self.lock:
@@ -128,16 +137,26 @@ class Backend(object):
             self.shutdown.set()
 
         self.client.remove_event_handler(
-            "TorrentAddedEvent", self.on_torrent_add)
+            b"TorrentAddedEvent", self.on_torrent_add)
         self.client.remove_event_handler(
-            "TorrentRemovedEvent", self.on_torrent_remove)
+            b"TorrentRemovedEvent", self.on_torrent_remove)
         self.client.remove_event_handler(
-            "CacheFlushedEvent", self.on_cache_flush)
+            b"ReadPieceEvent", self.on_read_piece)
 
     def update_all(self):
         with self.lock:
+            for info_hash, torrent in list(self.torrents.items()):
+                torrent.cleanup()
+                if not torrent.is_alive():
+                    del self.torrents[info_hash]
             torrents = list(self.torrents.values())
         torrent_requests = [(t, t.request_update()) for t in torrents]
+        hash_to_info_request = self.client.request(
+            "core.get_torrents_status", {},
+            ("piece_priority_map", "keep_redundant_connections_map"))
+
+        updates = []
+
         for torrent, request in torrent_requests:
             try:
                 result = request.result()
@@ -145,16 +164,49 @@ class Backend(object):
                 # Don't let a chain of timeouts hold up the updates
                 raise
             except:
-                log().exception("during update")
+                log().exception("during update request")
                 continue
-            torrent.cleanup()
-            alive_before = torrent.is_alive()
-            torrent.reduce(result)
-            if not alive_before:
-                with self.lock:
-                    if not torrent.is_alive():
-                        log().info("dereferencing %s", torrent.info_hash)
-                        self.torrents.pop(torrent.info_hash)
+            for update in torrent.reduce(result):
+                updates.append(update)
+
+        try:
+            hash_to_info = hash_to_info_request.result()
+        except:
+            log().exception("during global update request")
+            hash_to_info = {}
+
+        for update in self.do_global_update(hash_to_info):
+            updates.append(update)
+
+        # Get results of all updates, to surface any exceptions
+        for update in updates:
+            try:
+                update.result()
+            except concurrent.futures.TimeoutError:
+                # Don't let a chain of timeouts hold up the updates
+                raise
+            except:
+                log().exception("during an update")
+                continue
+
+    def do_global_update(self, hash_to_info):
+        for info_hash, info in hash_to_info.items():
+            if info_hash in self.torrents:
+                continue
+            delete_p_ks = [
+                k for k in info[b"piece_priority_map"]
+                if k.startswith(self.key_prefix().encode())]
+            if delete_p_ks:
+                yield self.client.request(
+                    "pieceio.update_piece_priority_map", info_hash,
+                    delete=delete_p_ks)
+            delete_k_ks = [
+                k for k in info[b"keep_redundant_connections_map"]
+                if k.startswith(self.key_prefix().encode())]
+            if delete_k_ks:
+                yield self.client.request(
+                    "pieceio.update_keep_redundant_connections_map",
+                    info_hash, delete=delete_k_ks)
 
     def updater(self, shutdown):
         log().debug("start")
@@ -170,40 +222,40 @@ class Backend(object):
         finally:
             log().debug("shutting down")
 
-    def on_torrent_add(self, event):
+    def on_torrent_add(self, torrent_id):
         with self.lock:
-            torrent = self.torrents.get(event.torrent_id)
+            torrent = self.torrents.get(torrent_id)
 
         if not torrent:
             return
 
         torrent.on_add()
 
-    def on_torrent_remove(self, event):
+    def on_torrent_remove(self, torrent_id):
         with self.lock:
-            torrent = self.torrents.get(event.torrent_id)
+            torrent = self.torrents.get(torrent_id)
 
         if not torrent:
             return
 
         torrent.on_remove()
 
-    def on_cache_flush(self, event):
+    def on_read_piece(self, torrent_id, piece, data, error):
         with self.lock:
-            torrent = self.torrents.get(event.torrent_id)
+            torrent = self.torrents.get(torrent_id)
 
         if not torrent:
             return
 
-        torrent.on_cache_flush()
+        torrent.on_read_piece(piece, data, error)
 
 
 class Torrent(object):
 
     FIELDS = (b"files", b"piece_length", b"piece_bitfield",
               b"save_path", b"hash", b"num_pieces", b"sequential_download",
-              b"piece_priority_map", b"state", b"cache_status",
-              b"keep_redundant_connections")
+              b"piece_priority_map", b"state",
+              b"keep_redundant_connections_map")
 
     def __init__(self, backend, info_hash):
         self.backend = backend
@@ -213,23 +265,29 @@ class Torrent(object):
         self.cv = threading.Condition(self.lock)
         self.client = self.backend.client
         self.info = None
-        self.handles = set()
+        self.handles = weakref.WeakSet()
         self.last_released = None
+        self.read_piece_to_f = collections.defaultdict(weakref.WeakSet)
+        self.pre_info_reads = set()
+        self.p_to_t_readahead = {}
 
-    def piece_range(self, index, offset, size_bytes, size_pieces):
+    def key_prefix(self):
+        return self.backend.key_prefix()
+
+    def piece_split(self, index, offset, size, pieces):
         with self.lock:
             info = self.info
-        return file_range_pieces(info, index, offset, size_bytes, size_pieces)
+        size = max(size, pieces * info[b"piece_length"])
+        return file_range_split(info, index, offset, size)
+
+    def piece_range(self, index, offset, size, pieces):
+        return [p for p, _, _ in self.piece_split(index, offset, size, pieces)]
 
     def iter_reads(self):
         with self.lock:
             for handle in list(self.handles):
                 for read in list(handle.iter_reads()):
                     yield read
-
-    def cleanup(self):
-        with self.lock:
-            pass
 
     def apply_delta(self, key, old, value):
         if key == b"sequential_download":
@@ -238,14 +296,19 @@ class Torrent(object):
         if key == b"yatfs_piece_priority_map":
             yield self.client.request(
                 b"pieceio.update_piece_priority_map", self.info_hash,
-                update=value, pop=list(set(old.keys()) - set(value.keys())))
+                update=value, delete=list(set(old.keys()) - set(value.keys())))
         if key == b"paused" and old and not value:
             yield self.client.request(
                 b"core.resume_torrent", [self.info_hash])
         if key == b"keep_redundant_connections":
+            key = self.key_prefix() + "keepalive"
+            if value:
+                kwargs = {"update": {key: value}}
+            else:
+                kwargs = {"delete": (key,)}
             yield self.client.request(
-                b"pieceio.set_keep_redundant_connections",
-                self.info_hash, value)
+                b"pieceio.update_keep_redundant_connections_map",
+                self.info_hash, **kwargs)
 
     def apply_deltas(self, info, target_info):
         changes = []
@@ -259,30 +322,75 @@ class Torrent(object):
     def get_target_info_locked(self):
         target_info = {}
 
-        piece_length = self.info[b"piece_length"]
-
-        priority_map = { } 
-
+        priority_maps = {}
         for read in self.iter_reads():
-            id = hash(read)
-            priority_map[("yatfs_%s_reading" % id).encode()] = {
-                p: 7 for p in read.reading_pieces() }
-            priority_map[("yatfs_%s_readahead" % id).encode()] = {
-                p: 4 for p in read.readahead_pieces() }
+            target_p_to_prio = {}
+            priority = self.backend.reading_priority
+            for p in read.pieces():
+                if self.info.have_piece(p):
+                    continue
+                target_p_to_prio[p] = priority
+            id = str(hash(read))
+            key = (self.key_prefix() + id).encode()
+            if target_p_to_prio:
+                priority_maps[key] = target_p_to_prio
+        target_p_to_prio = {}
+        for p in self.p_to_t_readahead.keys():
+            if self.info.have_piece(p):
+                continue
+            target_p_to_prio[p] = self.backend.readahead_priority
+        key = (self.key_prefix() + "readahead").encode()
+        if target_p_to_prio:
+            priority_maps[key] = target_p_to_prio
+        target_info[b"yatfs_piece_priority_map"] = priority_maps
 
-        target_info[b"yatfs_piece_priority_map"] = priority_map
-        self.info[b"yatfs_piece_priority_map"] = {
-            k: m for k, m in list(self.info[b"piece_priority_map"].items())
-            if k.startswith(b"yatfs_")}
+        priority_maps = {}
+        for k, p_to_prio in self.info[b"piece_priority_map"].items():
+            if not k.startswith(self.key_prefix().encode()):
+                continue
+            filtered_p_to_prio = {}
+            for p, prio in p_to_prio.items():
+                if self.info.have_piece(p):
+                    continue
+                filtered_p_to_prio[p] = prio
+            if filtered_p_to_prio:
+                priority_maps[k] = filtered_p_to_prio
+        self.info[b"yatfs_piece_priority_map"] = priority_maps
 
         self.info[b"paused"] = self.info[b"state"] == b"Paused"
 
         if self.is_alive():
             target_info[b"paused"] = False
             target_info[b"sequential_download"] = True
+        self.info[b"keep_redundant_connections"] = bool(
+            self.info[b"keep_redundant_connections_map"].get(
+                (self.key_prefix() + "keepalive").encode()))
         target_info[b"keep_redundant_connections"] = self.is_alive()
 
         return target_info
+
+    def cleanup(self):
+        now = time.time()
+        with self.lock:
+            self.p_to_t_readahead= {
+                p: t for p, t in self.p_to_t_readahead.items() if t >= now}
+
+    def add_readahead_with_info(self, read):
+        size_bytes = max(read.size, self.backend.readahead_bytes)
+        size_pieces = self.backend.readahead_pieces
+        pieces = self.piece_range(
+            read.file_index(), read.offset, size_bytes, size_pieces)
+        t = time.time() + self.backend.keepalive
+        with self.lock:
+            self.p_to_t_readahead.update({p: t for p in pieces})
+
+    def add_readahead(self, read):
+        with self.lock:
+            info = self.info
+            if not info:
+                self.pre_info_reads.add(read)
+                return
+        self.add_readahead_with_info(read)
 
     def request_update(self):
         return self.client.request(
@@ -304,24 +412,15 @@ class Torrent(object):
 
         with self.lock:
             self.info = info
+            for read in self.pre_info_reads:
+                self.add_readahead_with_info(read)
+            self.pre_info_reads = set()
             self.cv.notifyAll()
             if b"hash" not in info:
                 return None
             target_info = self.get_target_info_locked()
-            should_flush = False
-            reading_want = set()
-            for read in self.iter_reads():
-                if read.finished is not None:
-                    continue
-                reading_want.update(read.reading_pieces())
-            if any(info.have_piece(p) and not info.piece_on_disk(p)
-                    for p in reading_want):
-                should_flush = True
 
         deltas = self.apply_deltas(info, target_info)
-        if should_flush:
-            deltas.append(self.client.request(
-                "pieceio.flush_cache", self.info_hash))
         return deltas
 
     def update(self):
@@ -331,18 +430,7 @@ class Torrent(object):
 
     def is_alive(self):
         with self.lock:
-            if self.last_released is None:
-                return True
-            now = time.time()
-            if self.last_released > now:
-                return False
-            keepalive_time = self.last_released + self.backend.keepalive
-            if now > keepalive_time:
-                return False
-            return False
-
-    def on_cache_flushed(self):
-        self.update()
+            return bool(self.handles or self.p_to_t_readahead)
 
     def on_add(self):
         self.update()
@@ -380,64 +468,71 @@ class Torrent(object):
             if need_update:
                 self.update()
 
-    def wait_for_pieces_on_disk(self, inode, pieces_callback, timeout):
-        def data_on_disk(info):
-            for p in pieces_callback():
-                if not info.piece_on_disk(p):
-                    return False
-            return True
-        self.info_wait(data_on_disk, inode, timeout)
+    def wait_for_pieces(self, inode, pieces_callback, timeout):
+        def have_pieces(info):
+            return all(info.have_piece(p) for p in pieces_callback())
+        self.info_wait(have_pieces, inode, timeout)
 
-    def wait_for_path(self, inode, timeout):
-        def get_path(info):
-            if b"save_path" not in info:
-                return
-            if b"files" not in info:
-                return
-            if len(info[b"files"]) <= inode.file_index():
-                return
-            return os.path.join(
-                info[b"save_path"],
-                info[b"files"][inode.file_index()][b"path"])
-        return self.info_wait(get_path, inode, timeout)
+    def read_piece_request(self, piece, timeout=None):
+        f = concurrent.futures.Future()
+        f.set_running_or_notify_cancel()
+        with self.lock:
+            info = self.info
+            self.read_piece_to_f[piece].add(f)
+        self.client.call("pieceio.read_piece", info[b"hash"], piece)
+        return f
+
+    def on_read_piece(self, piece, data, error):
+        with self.lock:
+            fs = self.read_piece_to_f.pop(piece, [])
+        if error[b"value"]:
+            log().error("Reading piece %s: %s", piece, error)
+        for f in fs:
+            if error[b"value"]:
+                f.set_exception(OSError(errno.EIO, "read piece error"))
+            else:
+                f.set_result(data)
 
 
 class Read(object):
 
     def __init__(self, handle, offset, size):
-        self.handle = handle
         self.inode = handle.inode
         self.torrent = handle.torrent
         self.backend = handle.backend
         self.offset = offset
         self.size = size
-        self.finished = None
+        self.time = time.time()
 
     def file_index(self):
         return self.inode.file_index()
 
-    def reading_pieces(self):
+    def split(self):
+        return self.torrent.piece_split(
+            self.file_index(), self.offset, self.size, 0)
+
+    def pieces(self):
         return self.torrent.piece_range(
             self.file_index(), self.offset, self.size, 0)
 
-    def readahead_pieces(self):
-        size_bytes = max(self.size, self.backend.readahead_bytes)
-        size_pieces = self.backend.readahead_pieces
-        return self.torrent.piece_range(
-            self.file_index(), self.offset, size_bytes, size_pieces)
+    def wait(self):
+        self.torrent.wait_for_pieces(
+            self.inode, self.pieces, self.backend.read_timeout)
 
-    def wait_for_data_on_disk(self):
-        self.torrent.wait_for_pieces_on_disk(
-            self.inode, self.reading_pieces, self.backend.read_timeout)
-
-    def is_alive(self):
-        if self.finished is None:
-            return True
-        if self.finished < time.time():
-            return False
-        if self.finished + self.backend.readahead_time > time.time():
-            return True
-        return False
+    def read(self):
+        log().debug("read: %s:%s[%s:%s]", self.torrent.info_hash,
+                self.file_index(), self.offset, self.size)
+        split = self.split()
+        log().debug("split is: %s", split)
+        split = [
+            (self.torrent.read_piece_request(p), lo, hi)
+            for p, lo, hi in split]
+        try:
+            return b"".join(
+                f.result(timeout=self.backend.read_timeout)[lo:hi]
+                for f, lo, hi in split)
+        except concurrent.futures.TimeoutError:
+            raise OSError(errno.ETIMEDOUT, "timeout reading piece")
 
 
 class Handle(fs.TorrentHandle):
@@ -447,61 +542,35 @@ class Handle(fs.TorrentHandle):
         self.torrent = torrent
 
         self.lock = torrent.lock
-        self.reads = set()
-        self.files = set()
-        self.released = None
-
-    def cleanup(self):
-        with self.lock:
-            self.reads = set(r for r in self.reads if r.is_alive())
-
-    def open_file(self):
-        path = self.torrent.wait_for_path(
-            self.inode, self.backend.read_timeout)
-        return open(path, mode="rb")
+        self.reads = weakref.WeakSet()
 
     def iter_reads(self):
         for read in list(self.reads):
             yield read
-
-    def read_inner(self, offset, size):
-        try:
-            f = self.files.pop()
-        except KeyError:
-            f = self.open_file()
-
-        try:
-            f.seek(offset)
-            return f.read(size)
-        finally:
-            self.files.add(f)
 
     def read(self, offset, size):
         read = Read(self, offset, size)
         with self.lock:
             self.reads.add(read)
 
+        self.torrent.add_readahead(read)
+
         try:
-            try:
-                read.wait_for_data_on_disk()
-                return self.read_inner(offset, size)
-            except OSError as e:
-                log().exception(
-                    "during read(%s, %s, %s, %s)", self.inode.info_hash(),
-                    self.inode.file_index(), offset, size)
-                raise llfuse.FUSEError(e.errno)
-            except:
-                log().exception(
-                    "during read(%s, %s, %s, %s)", self.inode.info_hash(),
-                    self.inode.file_index(), offset, size)
-                raise llfuse.FUSEError(errno.EIO)
-        finally:
-            with self.lock:
-                read.finished = time.time()
+            read.wait()
+            return read.read()
+        except OSError as e:
+            log().exception(
+                "during read(%s, %s, %s, %s)", self.inode.info_hash(),
+                self.inode.file_index(), offset, size)
+            raise llfuse.FUSEError(e.errno)
+        except:
+            log().exception(
+                "during read(%s, %s, %s, %s)", self.inode.info_hash(),
+                self.inode.file_index(), offset, size)
+            raise llfuse.FUSEError(errno.EIO)
 
     def release(self):
-        with self.lock:
-            self.released = True
+        pass
 
 
 def configure_backend(
