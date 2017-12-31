@@ -66,9 +66,10 @@ def file_range_split(info, idx, offset, size):
 class Info(dict):
 
     def have_piece(self, i):
-        if i >> 3 >= len(self.get(b"piece_bitfield", b"")):
+        if i >> 3 >= len(self.get(b"yatfsrpc.piece_bitfield", b"")):
             return False
-        return bool(self[b"piece_bitfield"][i >> 3] & (0x80 >> (i & 7)))
+        return bool(
+            self[b"yatfsrpc.piece_bitfield"][i >> 3] & (0x80 >> (i & 7)))
 
 
 class Backend(object):
@@ -128,7 +129,7 @@ class Backend(object):
         self.client.add_event_handler(
             b"TorrentRemovedEvent", self.on_torrent_remove)
         self.client.add_event_handler(
-            b"ReadPieceEvent", self.on_read_piece)
+            b"YatfsReadPieceEvent", self.on_read_piece)
 
     def destroy(self):
         with self.lock:
@@ -141,7 +142,7 @@ class Backend(object):
         self.client.remove_event_handler(
             b"TorrentRemovedEvent", self.on_torrent_remove)
         self.client.remove_event_handler(
-            b"ReadPieceEvent", self.on_read_piece)
+            b"YatfsReadPieceEvent", self.on_read_piece)
 
     def update_all(self):
         with self.lock:
@@ -152,8 +153,9 @@ class Backend(object):
             torrents = list(self.torrents.values())
         torrent_requests = [(t, t.request_update()) for t in torrents]
         hash_to_info_request = self.client.request(
-            "core.get_torrents_status", {},
-            ("piece_priority_map", "keep_redundant_connections_map"))
+            "core.get_torrents_status", {}, (
+                "yatfsrpc.piece_priority_map",
+                "yatfsrpc.keep_redundant_connections_map"))
 
         updates = []
 
@@ -194,18 +196,18 @@ class Backend(object):
             if info_hash in self.torrents:
                 continue
             delete_p_ks = [
-                k for k in info[b"piece_priority_map"]
+                k for k in info[b"yatfsrpc.piece_priority_map"]
                 if k.startswith(self.key_prefix().encode())]
             if delete_p_ks:
                 yield self.client.request(
-                    "pieceio.update_piece_priority_map", info_hash,
+                    "yatfsrpc.update_piece_priority_map", info_hash,
                     delete=delete_p_ks)
             delete_k_ks = [
-                k for k in info[b"keep_redundant_connections_map"]
+                k for k in info[b"yatfsrpc.keep_redundant_connections_map"]
                 if k.startswith(self.key_prefix().encode())]
             if delete_k_ks:
                 yield self.client.request(
-                    "pieceio.update_keep_redundant_connections_map",
+                    "yatfsrpc.update_keep_redundant_connections_map",
                     info_hash, delete=delete_k_ks)
 
     def updater(self, shutdown):
@@ -252,10 +254,11 @@ class Backend(object):
 
 class Torrent(object):
 
-    FIELDS = (b"files", b"piece_length", b"piece_bitfield",
-              b"save_path", b"hash", b"num_pieces", b"sequential_download",
-              b"piece_priority_map", b"state",
-              b"keep_redundant_connections_map")
+    FIELDS = (b"files", b"piece_length", b"yatfsrpc.piece_bitfield",
+              b"save_path", b"hash", b"num_pieces",
+              b"yatfsrpc.sequential_download",
+              b"yatfsrpc.piece_priority_map", b"state",
+              b"yatfsrpc.keep_redundant_connections_map")
 
     def __init__(self, backend, info_hash):
         self.backend = backend
@@ -290,24 +293,24 @@ class Torrent(object):
                     yield read
 
     def apply_delta(self, key, old, value):
-        if key == b"sequential_download":
+        if key == b"yatfsrpc.sequential_download":
             yield self.client.request(
-                b"pieceio.set_sequential_download", self.info_hash, value)
-        if key == b"yatfs_piece_priority_map":
+                b"yatfsrpc.set_sequential_download", self.info_hash, value)
+        if key == b"yatfsrpc.piece_priority_map":
             yield self.client.request(
-                b"pieceio.update_piece_priority_map", self.info_hash,
+                b"yatfsrpc.update_piece_priority_map", self.info_hash,
                 update=value, delete=list(set(old.keys()) - set(value.keys())))
         if key == b"paused" and old and not value:
             yield self.client.request(
                 b"core.resume_torrent", [self.info_hash])
-        if key == b"keep_redundant_connections":
+        if key == b"yatfsrpc.keep_redundant_connections_map":
             key = self.key_prefix() + "keepalive"
             if value:
                 kwargs = {"update": {key: value}}
             else:
                 kwargs = {"delete": (key,)}
             yield self.client.request(
-                b"pieceio.update_keep_redundant_connections_map",
+                b"yatfsrpc.update_keep_redundant_connections_map",
                 self.info_hash, **kwargs)
 
     def apply_deltas(self, info, target_info):
@@ -342,10 +345,10 @@ class Torrent(object):
         key = (self.key_prefix() + "readahead").encode()
         if target_p_to_prio:
             priority_maps[key] = target_p_to_prio
-        target_info[b"yatfs_piece_priority_map"] = priority_maps
+        target_info[b"yatfsrpc.piece_priority_map"] = priority_maps
 
         priority_maps = {}
-        for k, p_to_prio in self.info[b"piece_priority_map"].items():
+        for k, p_to_prio in self.info[b"yatfsrpc.piece_priority_map"].items():
             if not k.startswith(self.key_prefix().encode()):
                 continue
             filtered_p_to_prio = {}
@@ -355,17 +358,17 @@ class Torrent(object):
                 filtered_p_to_prio[p] = prio
             if filtered_p_to_prio:
                 priority_maps[k] = filtered_p_to_prio
-        self.info[b"yatfs_piece_priority_map"] = priority_maps
+        self.info[b"yatfsrpc.piece_priority_map"] = priority_maps
 
         self.info[b"paused"] = self.info[b"state"] == b"Paused"
 
         if self.is_alive():
             target_info[b"paused"] = False
-            target_info[b"sequential_download"] = True
-        self.info[b"keep_redundant_connections"] = bool(
-            self.info[b"keep_redundant_connections_map"].get(
+            target_info[b"yatfsrpc.sequential_download"] = True
+        self.info[b"yatfsrpc.keep_redundant_connections"] = bool(
+            self.info[b"yatfsrpc.keep_redundant_connections_map"].get(
                 (self.key_prefix() + "keepalive").encode()))
-        target_info[b"keep_redundant_connections"] = self.is_alive()
+        target_info[b"yatfsrpc.keep_redundant_connections"] = self.is_alive()
 
         return target_info
 
@@ -479,7 +482,7 @@ class Torrent(object):
         with self.lock:
             info = self.info
             self.read_piece_to_f[piece].add(f)
-        self.client.call("pieceio.read_piece", info[b"hash"], piece)
+        self.client.call("yatfsrpc.read_piece", info[b"hash"], piece)
         return f
 
     def on_read_piece(self, piece, data, error):
