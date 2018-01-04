@@ -1,21 +1,31 @@
-import asyncio
 import base64
-import concurrent
-import functools
+import collections
+import errno
 import logging
 import os
+import threading
+import time
+import weakref
+
+import better_bencode
+import concurrent.futures
+import llfuse
+
+import deluge_client_sync
+from yatfs import fs
+
+
+DEFAULT_KEY = "yatfs"
+DEFAULT_KEEPALIVE = 60
+DEFAULT_READ_TIMEOUT = 60
+DEFAULT_READAHEAD_PIECES = 4
+DEFAULT_READAHEAD_BYTES = 0x2000000
+DEFAULT_READAHEAD_PRIORITY = 4
+DEFAULT_READING_PRIORITY = 7
 
 
 def log():
     return logging.getLogger(__name__)
-
-
-def completed_without_error(fut):
-    return fut.done() and not fut.cancelled() and not fut.exception()
-
-
-def completed_with_error(fut):
-    return fut.done() and (fut.cancelled() or fut.exception())
 
 
 def file_range_split(info, idx, offset, size):
@@ -53,639 +63,523 @@ def file_range_split(info, idx, offset, size):
     return split
 
 
-class Bitfield(object):
-
-    def __init__(self, bitstring):
-        if not bitstring:
-            self.bitfield = b""
-        else:
-            self.bitfield = base64.b64decode(bitstring)
-
-    def get(self, i):
-        if i >> 3 >= len(self.bitfield):
-            return False
-        return bool(self.bitfield[i >> 3] & (0x80 >> (i & 7)))
-
-
 class Info(dict):
 
-    def __init__(self, info, cache_status, keep_redundant_connections):
-        dict.__init__(self, info)
-        self[b"piece_bitfield"] = Bitfield(self[b"piece_bitstring"])
-        piece_to_write_cache = {}
-        for cache_entry in cache_status[b"pieces"]:
-            if cache_entry[b"kind"] == 1:
-                piece_to_write_cache[cache_entry[b"piece"]] = cache_entry
-        self[b"piece_to_write_cache"] = piece_to_write_cache
-        self[b"keep_redundant_connections"] = keep_redundant_connections
-
-    def have_piece(self, piece):
-        return self[b"piece_bitfield"].get(piece)
-
-    def piece_on_disk(self, piece):
-        return (
-            self.have_piece(piece) and
-            piece not in self[b"piece_to_write_cache"])
-
-
-class Torrent(object):
-
-    FIELDS = ("files", "piece_length", "piece_bitstring",
-              "save_path", "hash", "num_pieces", "piece_priorities",
-              "sequential_download", "state", "message")
-
-    def __init__(self, backend, hash):
-        self.backend = backend
-        self.hash = hash
-
-        self.client = self.backend.client
-        self.config = self.backend.config
-        self.routine = self.config.routine
-        self.loop = self.routine.loop
-
-        self.fis = {}
-
-        self.info_task = None
-        self.info_time = None
-        self.flush_task = None
-        self.flushed_event_f = None
-        self.poll_task = None
-        self.prioritize_task = None
-        self.dekeepalive_task = None
-        self.piece_to_f = {}
-        self.we_prioritized_piece = set()
-        self.last_release_time = None
-
-    def log_debug(self, msg, *args):
-        log().debug("%s: %s" % (self.hash, msg), *args)
-
-    def log_error(self, msg, *args):
-        log().error("%s: %s" % (self.hash, msg), *args)
-
-    def log_exception(self, msg, *args):
-        log().exception("%s: %s" % (self.hash, msg), *args)
-
-    def should_keepalive(self):
-        if self.fis:
-            return True
-        if self.last_release_time is None:
-            return True
-        if (self.loop.time() - self.last_release_time <
-                self.config.params["keepalive"]):
-            return True
-        return False
-
-    def cleanup(self):
-        if self.fis:
-            return
-        if completed_with_error(self.prioritize_task):
-            try:
-                self.prioritize_task.result()
-            except:
-                self.log_exception("during cleanup prioritize")
-            self.prioritize()
-        if not self.should_keepalive():
-            if (not self.dekeepalive_task or
-                    completed_with_error(self.dekeepalive_task)):
-                self.dekeepalive()
-
-    def should_destroy(self):
-        if self.should_keepalive():
+    def have_piece(self, i):
+        if i >> 3 >= len(self.get(b"yatfsrpc.piece_bitfield", b"")):
             return False
-        if not completed_without_error(self.prioritize_task):
-            return False
-        if not self.dekeepalive_task:
-            return False
-        if not completed_without_error(self.dekeepalive_task):
-            return False
-        return True
-
-    def destroy(self):
-        self.log_debug("destroy")
-        if self.info_task:
-            self.info_task.cancel()
-        if self.flush_task:
-            self.flush_task.cancel()
-        if self.poll_task:
-            self.poll_task.cancel()
-        if self.prioritize_task:
-            self.prioritize_task.cancel()
-        if self.dekeepalive_task:
-            self.dekeepalive_task.cancel()
-        for future in self.piece_to_f.values():
-            future.cancel()
-        self.piece_to_f = {}
-        for fi in self.fis.values():
-            fi.destroy()
-        self.fis = {}
-
-    def is_info_expired(self):
-        if not self.info_task or not self.info_time:
-            return True
-        if not self.info_task.done():
-            return False
-        if self.info_task.cancelled() or (
-                self.info_task.exception() is not None):
-            return True
-        if (self.loop.time() - self.info_time >
-                self.config.params["info_cache_time"]):
-            return True
-        return False
-
-    def invalidate_info(self):
-        if self.info_task:
-            self.info_task.cancel()
-        self.info_task = None
-
-    def start_info_task(self):
-        self.invalidate_info()
-        self.info_task = self.loop.create_task(self.do_get_info_async())
-
-    @asyncio.coroutine
-    def get_info_async(self):
-        if self.is_info_expired():
-            self.start_info_task()
-        while True:
-            try:
-                return (yield from asyncio.shield(
-                    self.info_task, loop=self.loop))
-            except concurrent.futures.CancelledError:
-                # Task might have already been restarted.
-                if self.info_task is None or self.info_task.cancelled():
-                    self.start_info_task()
-
-    @asyncio.coroutine
-    def fetch_info_async(self):
-        return (yield from self.client.call_async(
-            "core.get_torrent_status", self.hash, self.FIELDS))
-
-    @asyncio.coroutine
-    def fetch_cache_status_async(self):
-        return (yield from self.client.call_async(
-            "pieceio.get_cache_info", self.hash))
-
-    @asyncio.coroutine
-    def fetch_keep_redundant_connections_async(self):
-        return (yield from self.client.call_async(
-            "pieceio.keep_redundant_connections", self.hash))
-
-    @asyncio.coroutine
-    def do_get_info_async(self):
-        self.log_debug("update_info()")
-        info = yield from self.fetch_info_async()
-        while b"hash" not in info:
-            # Can happen while trying to reprioritize a closing torrent that
-            # never got added.
-            if not self.fis:
-                return None
-            data = yield from self.config.get_torrent_data_async(self.hash)
-            data = base64.b64encode(data)
-            hash = yield from self.client.call_async(
-                "core.add_torrent_file", None, data, None)
-            assert hash is not None and hash.decode() == self.hash, (hash,
-                    self.hash)
-            info = yield from self.fetch_info_async()
-            yield from self.client.call_async(
-                "pieceio.prioritize_pieces", self.hash,
-                [0] * info[b"num_pieces"])
-            self.we_prioritized_piece = set()
-            info = yield from self.fetch_info_async()
-        cache_status, keep_redundant_connections = yield from asyncio.gather(
-            self.fetch_cache_status_async(),
-            self.fetch_keep_redundant_connections_async(),
-            loop=self.loop)
-        self.info_time = self.loop.time()
-        info = Info(info, cache_status, keep_redundant_connections)
-        outstanding = [
-            p for p in range(0, info[b"num_pieces"])
-            if info[b"piece_priorities"][p] != 0 and not info.have_piece(p)]
-        self.log_debug("outstanding: %s", outstanding)
-        for piece, future in list(self.piece_to_f.items()):
-            if info.have_piece(piece):
-                if not future.done():
-                    future.set_result(None)
-                del self.piece_to_f[piece]
-        if not self.piece_to_f:
-            if self.poll_task:
-                self.poll_task.cancel()
-        self.prioritize()
-        return info
-
-    def on_cache_flushed(self):
-        if self.flushed_event_f and not self.flushed_event_f.done():
-            self.flushed_event_f.set_result(None)
-        else:
-            self.log_debug("spurious cache flush")
-        self.invalidate_info()
-
-    @asyncio.coroutine
-    def do_flush_cache_async(self):
-        self.log_debug("flush_cache")
-        self.flushed_event_f = asyncio.Future(loop=self.loop)
-        yield from self.client.call_async("pieceio.flush_cache", self.hash)
-        yield from asyncio.wait_for(
-            self.flushed_event_f, self.config.params["cache_flush_timeout"],
-            loop=self.loop)
-
-    @asyncio.coroutine
-    def flush_cache_async(self):
-        if not self.flush_task or self.flush_task.done():
-            self.flush_task = self.loop.create_task(
-                self.do_flush_cache_async())
-        yield from asyncio.shield(self.flush_task, loop=self.loop)
-
-    @asyncio.coroutine
-    def poll_async(self):
-        while True:
-            self.start_info_task()
-            yield from asyncio.sleep(
-                self.config.params["info_poll_interval"], loop=self.loop)
-
-    @asyncio.coroutine
-    def ensure_piece_async(self, piece, timeout=None):
-        info = yield from self.get_info_async()
-        if info.have_piece(piece):
-            return
-        if piece not in self.piece_to_f:
-            self.piece_to_f[piece] = asyncio.Future(loop=self.loop)
-        if not self.poll_task or self.poll_task.done():
-            self.poll_task = self.loop.create_task(self.poll_async())
-        yield from asyncio.wait_for(
-            asyncio.shield(self.piece_to_f[piece], loop=self.loop), timeout,
-            loop=self.loop)
-
-    @asyncio.coroutine
-    def ensure_pieces_on_disk_async(self, pieces, timeout=None):
-        info = yield from self.get_info_async()
-        if all(info.piece_on_disk(p) for p in pieces):
-            return
-        yield from asyncio.gather(
-            *[self.ensure_piece_async(p, timeout=timeout) for p in pieces],
-            loop=self.loop)
-        while True:
-            info = yield from self.get_info_async()
-            if all(info.piece_on_disk(p) for p in pieces):
-                return
-            yield from self.flush_cache_async()
-
-    def dekeepalive(self):
-        if self.dekeepalive_task:
-            self.dekeepalive_task.cancel()
-        self.dekeepalive_task = self.loop.create_task(self.dekeepalive_async())
-
-    @asyncio.coroutine
-    def dekeepalive_async(self):
-        self.log_debug("dekeepalive")
-        yield from self.client.call_async(
-            "pieceio.set_keep_redundant_connections", self.hash, False)
-
-    def prioritize(self):
-        if self.prioritize_task:
-            self.prioritize_task.cancel()
-        self.prioritize_task = self.loop.create_task(self.prioritize_async())
-
-    @asyncio.coroutine
-    def prioritize_async(self):
-        info = yield from self.get_info_async()
-        if info is None:
-            assert not self.fis, self.fis
-            return
-
-        changes = []
-
-        if not info[b"sequential_download"]:
-            changes.append(self.client.call_async(
-                "pieceio.set_sequential_download", self.hash, True))
-
-        num_pieces = info[b"num_pieces"]
-        piece_length = info[b"piece_length"]
-        piece_priorities = list(info[b"piece_priorities"])
-        readahead_bytes = max(
-            self.config.params["readahead_pieces"] * piece_length,
-            self.config.params["readahead_bytes"])
-
-        desired_priorities = { p: 0 for p in range(num_pieces) }
-        reading_now = set()
-        readahead = set()
-
-        for fi in self.fis.values():
-            if fi.last_read_end is None:
-                continue
-            reading_now.update(fi.last_read_pieces)
-            split = file_range_split(
-                info, fi.idx, fi.last_read_end, readahead_bytes)
-            readahead.update(p for p, lo, hi in split)
-
-        desired_priorities.update({ p: 4 for p in readahead })
-        desired_priorities.update({ p: 7 for p in reading_now })
-
-        modified = {}
-        for p, prio in desired_priorities.items():
-            if info.have_piece(p):
-                continue
-            if piece_priorities[p] != prio:
-                if piece_priorities[p] == 0 and prio != 0:
-                    self.we_prioritized_piece.add(p)
-                elif piece_priorities[p] != 0 and prio == 0:
-                    if p not in self.we_prioritized_piece:
-                        continue
-                piece_priorities[p] = prio
-                modified[p] = prio
-
-        if modified:
-            self.log_debug("want %s", modified)
-            changes.append(self.client.call_async(
-                "pieceio.prioritize_pieces", self.hash, piece_priorities))
-
-        if info[b"state"] == b"Paused":
-            changes.append(self.client.call_async(
-                "core.resume_torrent", [self.hash]))
-
-        if info[b"keep_redundant_connections"] != True:
-            changes.append(self.client.call_async(
-                "pieceio.set_keep_redundant_connections",
-                self.hash, True))
-
-        if changes:
-            yield from asyncio.gather(*changes, loop=self.loop)
-            self.invalidate_info()
-
-
-class FileInfo(object):
-
-    def __init__(self, torrent, idx):
-        self.torrent = torrent
-        self.idx = idx
-
-        self.backend = self.torrent.backend
-        self.config = self.backend.config
-        self.routine = self.config.routine
-        self.loop = self.routine.loop
-
-        self.file_task = None
-        self.last_read_pieces = ()
-        self.last_read_end = None
-
-    def log_debug(self, msg, *args):
-        log().debug("%s:%s: %s" % (self.torrent.hash, self.idx, msg), *args)
-
-    def destroy(self):
-        self.log_debug("destroy")
-        if self.file_task:
-            self.file_task.cancel()
-        self.file_task = None
-
-    @asyncio.coroutine
-    def file_async(self):
-        if not self.file_task:
-            self.file_task = self.loop.create_task(self.do_file_async())
-        return (yield from asyncio.shield(self.file_task, loop=self.loop))
-
-    @asyncio.coroutine
-    def do_file_async(self):
-        self.log_debug("file_async")
-        info = yield from self.torrent.get_info_async()
-        path = os.path.join(
-            info[b"save_path"], info[b"files"][self.idx][b"path"])
-        return (yield from self.routine.call_io_async(
-            functools.partial(open, path, mode="rb")))
-
-    @asyncio.coroutine
-    def read_async(self, offset, size, piece_timeout=None):
-        info = yield from self.torrent.get_info_async()
-        split = file_range_split(info, self.idx, offset, size)
-        pieces = [p for p, lo, hi in split]
-        self.last_read_pieces = set(pieces)
-        self.last_read_end = offset + size
-        self.torrent.prioritize()
-        yield from self.torrent.ensure_pieces_on_disk_async(
-            pieces, timeout=piece_timeout)
-        f = yield from self.file_async()
-        return (yield from self.routine.call_io_async(
-            os.pread, f.fileno(), size, offset))
+        return bool(
+            self[b"yatfsrpc.piece_bitfield"][i >> 3] & (0x80 >> (i & 7)))
 
 
 class Backend(object):
 
-    SESSION_SETTINGS = (
-        "strict_end_game_mode", "smooth_connects", "min_reconnect_time",
-        "max_failcount", "connection_speed", "connections_limit",
-        "torrent_connect_boost")
-
-    def __init__(self, client, config):
+    def __init__(self, client, key=None, keepalive=None, read_timeout=None,
+                 readahead_pieces=None, readahead_bytes=None,
+                 readahead_priority=None, reading_priority=None):
         self.client = client
-        self.config = config
-        self.routine = self.config.routine
-        self.loop = self.routine.loop
+        self.keepalive = float(keepalive or DEFAULT_KEEPALIVE)
+        self.read_timeout = float(read_timeout or DEFAULT_READ_TIMEOUT)
+        self.readahead_pieces = int(
+            readahead_pieces or DEFAULT_READAHEAD_PIECES)
+        self.readahead_bytes = int(
+            readahead_bytes or DEFAULT_READAHEAD_BYTES)
+        self.key = key or DEFAULT_KEY
+        self.readahead_priority = int(
+            readahead_priority or DEFAULT_READAHEAD_PRIORITY)
+        self.reading_priority = int(
+            reading_priority or DEFAULT_READING_PRIORITY)
 
-        self.server_info = None
-        self.server_info_time = None
-        self.server_info_task = None
-
-        self.prioritize_task = None
-        self.last_release = None
-        self.poll_task = None
-
+        self.lock = threading.RLock()
         self.torrents = {}
-        self.fis = {}
-        self.next_fh = 0
+        self.initialized = False
+        self.shutdown = None
 
-    def is_server_info_expired(self):
-        if not self.server_info_task:
-            return True
-        if completed_with_error(self.server_info_task):
-            return True
-        if not completed_without_error(self.server_info_task):
-            return False
-        if (self.loop.time() - self.server_info_time >
-                self.config.params["server_info_cache_time"]):
-            return True
-        return False
+    def key_prefix(self):
+        return self.key + "_"
 
-    def invalidate_server_info(self):
-        if self.server_info_task:
-            self.server_info_task.cancel()
-        self.server_info_task = None
+    def open(self, inode, flags):
+        with self.lock:
+            torrent = self.get_torrent(inode.info_hash())
+            handle = Handle(self, inode, torrent)
+            torrent.handles.add(handle)
+        return handle
 
-    def start_server_info_task(self):
-        self.invalidate_server_info()
-        self.server_info_task = self.loop.create_task(
-            self.do_get_server_info_async())
-
-    @asyncio.coroutine
-    def get_server_info_async(self):
-        if self.is_server_info_expired():
-            self.start_server_info_task()
-        while True:
-            try:
-                return (yield from asyncio.shield(
-                    self.server_info_task, loop=self.loop))
-            except concurrent.futures.CancelledError:
-                # Task might have already been restarted.
-                if self.server_info_task.cancelled():
-                    self.start_server_info_task()
-
-    @asyncio.coroutine
-    def do_get_server_info_async(self):
-        log().debug("get_server_info")
-        lt_version, plugins = yield from asyncio.gather(
-            self.client.call_async("core.get_libtorrent_version"),
-            self.client.call_async("core.get_enabled_plugins"),
-            loop=self.loop)
-        self.server_info_time = self.loop.time()
-        if b"PieceIO" in plugins:
-            session_settings = yield from self.client.call_async(
-                "pieceio.session_get_settings", self.SESSION_SETTINGS)
-        else:
-            session_settings = None
-        self.prioritize()
-        return {
-            b"lt_version": lt_version,
-            b"plugins": plugins,
-            b"session_settings": session_settings}
-
-    @asyncio.coroutine
-    def validate_server_info_async(self):
-        server_info = yield from self.get_server_info_async()
-        lt_version = server_info[b"lt_version"]
-        lt_version = tuple(int(v) for v in lt_version.split(b"."))
-        if lt_version < (1, 1, 3, 0):
-            raise OSError(errno.EIO, "wrong libtorrent version")
-        if b"PieceIO" not in server_info[b"plugins"]:
-            raise OSError(errno.EIO, "the PieceIO plugin is not enabled")
-
-    def prioritize(self):
-        if self.prioritize_task:
-            self.prioritize_task.cancel()
-        self.prioritize_task = self.loop.create_task(self.prioritize_async())
-
-    @asyncio.coroutine
-    def prioritize_async(self):
-        log().debug("prioritize")
-        server_info = yield from self.get_server_info_async()
-        if not server_info[b"session_settings"]:
-            return
-
-        desired_settings = {
-            b"strict_end_game_mode": False,
-            b"smooth_connects": False,
-            b"min_reconnect_time": 15,
-            b"max_failcount": 5,
-            b"connection_speed": 500,
-            b"connections_limit": 964,
-            b"torrent_connect_boost": 50,
-        }
-
-        changes = []
-
-        if (server_info[b"session_settings"] != desired_settings):
-            changes.append(self.client.call_async(
-                "pieceio.session_set_settings",
-                **{k.decode(): v for k, v in desired_settings.items()}))
-
-        if changes:
-            yield from asyncio.gather(*changes, loop=self.loop)
-            self.invalidate_server_info()
-
-    def cleanup(self):
-        for hash, torrent in list(self.torrents.items()):
-            torrent.cleanup()
-            if torrent.should_destroy():
-                torrent.destroy()
-                del self.torrents[hash]
-
-    @asyncio.coroutine
-    def poll_async(self):
-        while True:
-            try:
-                self.start_server_info_task()
-                self.cleanup()
-                yield from asyncio.sleep(
-                    self.config.params["server_info_poll_interval"],
-                    loop=self.loop)
-            except:
-                log().exception("during server poll")
+    def get_torrent(self, info_hash):
+        with self.lock:
+            torrent = self.torrents.get(info_hash)
+            if not torrent:
+                torrent = Torrent(self, info_hash)
+                self.torrents[info_hash] = torrent
+            return torrent
 
     def init(self):
-        return self.routine.call_in_loop(self.init_async())
+        with self.lock:
+            assert not self.initialized
+            self.initialized = True
+            self.shutdown = threading.Event()
+            updater = threading.Thread(
+                name="update-all", target=self.updater,
+                args=(self.shutdown,))
+            updater.daemon = True
+            updater.start()
 
-    @asyncio.coroutine
-    def init_async(self):
-        log().debug("init")
-        yield from self.client.register_event_handler_async(
-            "CacheFlushedEvent", self.on_cache_flushed)
-        self.poll_task = self.loop.create_task(self.poll_async())
+        self.client.add_event_handler(
+            b"TorrentAddedEvent", self.on_torrent_add)
+        self.client.add_event_handler(
+            b"TorrentRemovedEvent", self.on_torrent_remove)
+        self.client.add_event_handler(
+            b"YatfsReadPieceEvent", self.on_read_piece)
 
     def destroy(self):
-        return self.routine.call_in_loop(self.destroy_async())
+        with self.lock:
+            assert self.initialized
+            self.initialized = False
+            self.shutdown.set()
 
-    @asyncio.coroutine
-    def destroy_async(self):
-        log().debug("destroy")
-        self.poll_task.cancel()
-        if self.server_info_task:
-            self.server_info_task.cancel()
-        if self.prioritize_task:
-            self.prioritize_task.cancel()
-        yield from self.client.deregister_event_handler_async(
-            "CacheFlushedEvent", self.on_cache_flushed)
+        self.client.remove_event_handler(
+            b"TorrentAddedEvent", self.on_torrent_add)
+        self.client.remove_event_handler(
+            b"TorrentRemovedEvent", self.on_torrent_remove)
+        self.client.remove_event_handler(
+            b"YatfsReadPieceEvent", self.on_read_piece)
 
-    def open(self, hash, index, flags):
-        return self.routine.call_in_loop(self.open_async(hash, index, flags))
+    def update_all(self):
+        with self.lock:
+            for info_hash, torrent in list(self.torrents.items()):
+                torrent.cleanup()
+                if not torrent.is_alive():
+                    del self.torrents[info_hash]
+            torrents = list(self.torrents.values())
+        torrent_requests = [(t, t.request_update()) for t in torrents]
+        hash_to_info_request = self.client.request(
+            "core.get_torrents_status", {}, (
+                "yatfsrpc.piece_priority_map",
+                "yatfsrpc.keep_redundant_connections_map"))
 
-    @asyncio.coroutine
-    def open_async(self, hash, file_index, flags):
-        log().debug("open(%s,%s,%s)", hash, file_index, flags)
-        fh = self.next_fh
-        self.next_fh += 1
-        if hash not in self.torrents:
-            self.torrents[hash] = Torrent(self, hash)
-        torrent = self.torrents[hash]
-        torrent.last_release_time = None
-        fi = FileInfo(torrent, file_index)
-        torrent.fis[fh] = fi
-        self.fis[fh] = fi
-        self.prioritize()
-        return fh
+        updates = []
 
-    def release(self, hash, index, fh):
-        return self.routine.call_in_loop(self.release_async(hash, index, fh))
-
-    @asyncio.coroutine
-    def release_async(self, hash, file_index, fh):
-        log().debug("release(%s,%s)", hash, file_index)
-        self.last_release = self.loop.time()
-        destroy_fi = None
-        if fh in self.fis:
-            destroy_fi = self.fis.pop(fh)
-        if hash in self.torrents:
-            torrent = self.torrents[hash]
-            if fh in torrent.fis:
-                del torrent.fis[fh]
-            if not torrent.fis:
-                torrent.last_release_time = self.loop.time()
-            if torrent.prioritize_task:
-                torrent.prioritize_task.cancel()
-            torrent.prioritize()
+        for torrent, request in torrent_requests:
             try:
-                yield from torrent.prioritize_task
-            except concurrent.futures.CancelledError:
-                pass
-        if destroy_fi:
-            destroy_fi.destroy()
+                result = request.result()
+            except concurrent.futures.TimeoutError:
+                # Don't let a chain of timeouts hold up the updates
+                raise
+            except:
+                log().exception("during update request")
+                continue
+            for update in torrent.reduce(result):
+                updates.append(update)
 
-    def on_cache_flushed(self, hash):
-        hash = hash.decode()
-        log().debug("on_cache_flushed(%s)", hash)
-        if hash in self.torrents:
-            self.torrents[hash].on_cache_flushed()
+        try:
+            hash_to_info = hash_to_info_request.result()
+        except:
+            log().exception("during global update request")
+            hash_to_info = {}
 
-    def read(self, hash, index, offset, size, fh):
-        return self.routine.call_in_loop(
-            self.read_async(hash, index, offset, size, fh))
+        for update in self.do_global_update(hash_to_info):
+            updates.append(update)
 
-    @asyncio.coroutine
-    def read_async(self, hash, idx, offset, size, fh):
-        yield from self.validate_server_info_async()
-        return (yield from self.fis[fh].read_async(
-            offset, size, piece_timeout=self.config.params["piece_timeout"]))
+        # Get results of all updates, to surface any exceptions
+        for update in updates:
+            try:
+                update.result()
+            except concurrent.futures.TimeoutError:
+                # Don't let a chain of timeouts hold up the updates
+                raise
+            except:
+                log().exception("during an update")
+                continue
+
+    def do_global_update(self, hash_to_info):
+        for info_hash, info in hash_to_info.items():
+            if info_hash in self.torrents:
+                continue
+            delete_p_ks = [
+                k for k in info[b"yatfsrpc.piece_priority_map"]
+                if k.startswith(self.key_prefix().encode())]
+            if delete_p_ks:
+                yield self.client.request(
+                    "yatfsrpc.update_piece_priority_map", info_hash,
+                    delete=delete_p_ks)
+            delete_k_ks = [
+                k for k in info[b"yatfsrpc.keep_redundant_connections_map"]
+                if k.startswith(self.key_prefix().encode())]
+            if delete_k_ks:
+                yield self.client.request(
+                    "yatfsrpc.update_keep_redundant_connections_map",
+                    info_hash, delete=delete_k_ks)
+
+    def updater(self, shutdown):
+        log().debug("start")
+        try:
+            while not shutdown.is_set():
+                try:
+                    self.update_all()
+                except:
+                    log().exception("during update-all")
+                time.sleep(1)
+        except:
+            log().exception("fatal error")
+        finally:
+            log().debug("shutting down")
+
+    def on_torrent_add(self, torrent_id):
+        with self.lock:
+            torrent = self.torrents.get(torrent_id)
+
+        if not torrent:
+            return
+
+        torrent.on_add()
+
+    def on_torrent_remove(self, torrent_id):
+        with self.lock:
+            torrent = self.torrents.get(torrent_id)
+
+        if not torrent:
+            return
+
+        torrent.on_remove()
+
+    def on_read_piece(self, torrent_id, piece, data, error):
+        with self.lock:
+            torrent = self.torrents.get(torrent_id)
+
+        if not torrent:
+            return
+
+        torrent.on_read_piece(piece, data, error)
+
+
+class Torrent(object):
+
+    FIELDS = (b"files", b"piece_length", b"yatfsrpc.piece_bitfield",
+              b"save_path", b"hash", b"num_pieces",
+              b"yatfsrpc.sequential_download",
+              b"yatfsrpc.piece_priority_map", b"state",
+              b"yatfsrpc.keep_redundant_connections_map")
+
+    def __init__(self, backend, info_hash):
+        self.backend = backend
+        self.info_hash = info_hash
+
+        self.lock = self.backend.lock
+        self.cv = threading.Condition(self.lock)
+        self.client = self.backend.client
+        self.info = None
+        self.handles = weakref.WeakSet()
+        self.last_released = None
+        self.read_piece_to_f = collections.defaultdict(weakref.WeakSet)
+        self.pre_info_reads = set()
+        self.p_to_t_readahead = {}
+
+    def key_prefix(self):
+        return self.backend.key_prefix()
+
+    def piece_split(self, index, offset, size, pieces):
+        with self.lock:
+            info = self.info
+        size = max(size, pieces * info[b"piece_length"])
+        return file_range_split(info, index, offset, size)
+
+    def piece_range(self, index, offset, size, pieces):
+        return [p for p, _, _ in self.piece_split(index, offset, size, pieces)]
+
+    def iter_reads(self):
+        with self.lock:
+            for handle in list(self.handles):
+                for read in list(handle.iter_reads()):
+                    yield read
+
+    def apply_delta(self, key, old, value):
+        if key == b"yatfsrpc.sequential_download":
+            yield self.client.request(
+                b"yatfsrpc.set_sequential_download", self.info_hash, value)
+        if key == b"yatfsrpc.piece_priority_map":
+            yield self.client.request(
+                b"yatfsrpc.update_piece_priority_map", self.info_hash,
+                update=value, delete=list(set(old.keys()) - set(value.keys())))
+        if key == b"paused" and old and not value:
+            yield self.client.request(
+                b"core.resume_torrent", [self.info_hash])
+        if key == b"yatfsrpc.keep_redundant_connections_map":
+            key = self.key_prefix() + "keepalive"
+            if value:
+                kwargs = {"update": {key: value}}
+            else:
+                kwargs = {"delete": (key,)}
+            yield self.client.request(
+                b"yatfsrpc.update_keep_redundant_connections_map",
+                self.info_hash, **kwargs)
+
+    def apply_deltas(self, info, target_info):
+        changes = []
+        for key, value in list(target_info.items()):
+            old = info.get(key)
+            if old != value:
+                for change in self.apply_delta(key, old, value):
+                    changes.append(change)
+        return changes
+
+    def get_target_info_locked(self):
+        target_info = {}
+
+        priority_maps = {}
+        for read in self.iter_reads():
+            target_p_to_prio = {}
+            priority = self.backend.reading_priority
+            for p in read.pieces():
+                if self.info.have_piece(p):
+                    continue
+                target_p_to_prio[p] = priority
+            id = str(hash(read))
+            key = (self.key_prefix() + id).encode()
+            if target_p_to_prio:
+                priority_maps[key] = target_p_to_prio
+        target_p_to_prio = {}
+        for p in self.p_to_t_readahead.keys():
+            if self.info.have_piece(p):
+                continue
+            target_p_to_prio[p] = self.backend.readahead_priority
+        key = (self.key_prefix() + "readahead").encode()
+        if target_p_to_prio:
+            priority_maps[key] = target_p_to_prio
+        target_info[b"yatfsrpc.piece_priority_map"] = priority_maps
+
+        priority_maps = {}
+        for k, p_to_prio in self.info[b"yatfsrpc.piece_priority_map"].items():
+            if not k.startswith(self.key_prefix().encode()):
+                continue
+            filtered_p_to_prio = {}
+            for p, prio in p_to_prio.items():
+                if self.info.have_piece(p):
+                    continue
+                filtered_p_to_prio[p] = prio
+            if filtered_p_to_prio:
+                priority_maps[k] = filtered_p_to_prio
+        self.info[b"yatfsrpc.piece_priority_map"] = priority_maps
+
+        self.info[b"paused"] = self.info[b"state"] == b"Paused"
+
+        if self.is_alive():
+            target_info[b"paused"] = False
+            target_info[b"yatfsrpc.sequential_download"] = True
+        self.info[b"yatfsrpc.keep_redundant_connections"] = bool(
+            self.info[b"yatfsrpc.keep_redundant_connections_map"].get(
+                (self.key_prefix() + "keepalive").encode()))
+        target_info[b"yatfsrpc.keep_redundant_connections"] = self.is_alive()
+
+        return target_info
+
+    def cleanup(self):
+        now = time.time()
+        with self.lock:
+            self.p_to_t_readahead= {
+                p: t for p, t in self.p_to_t_readahead.items() if t >= now}
+
+    def add_readahead_with_info(self, read):
+        size_bytes = max(read.size, self.backend.readahead_bytes)
+        size_pieces = self.backend.readahead_pieces
+        pieces = self.piece_range(
+            read.file_index(), read.offset, size_bytes, size_pieces)
+        t = time.time() + self.backend.keepalive
+        with self.lock:
+            self.p_to_t_readahead.update({p: t for p in pieces})
+
+    def add_readahead(self, read):
+        with self.lock:
+            info = self.info
+            if not info:
+                self.pre_info_reads.add(read)
+                return
+        self.add_readahead_with_info(read)
+
+    def request_update(self):
+        return self.client.request(
+                "core.get_torrent_status", self.info_hash, self.FIELDS)
+
+    def add(self, raw_torrent):
+        tinfo = better_bencode.loads(raw_torrent)[b"info"]
+        if b"files" in tinfo:
+            num_files = len(tinfo[b"files"])
+        else:
+            num_files = 1
+        options = {b"file_priorities": [0] * num_files}
+        self.client.call(
+            "core.add_torrent_file", None, base64.b64encode(raw_torrent), 
+            options)
+
+    def reduce(self, status_dict):
+        info = Info(status_dict)
+
+        with self.lock:
+            self.info = info
+            for read in self.pre_info_reads:
+                self.add_readahead_with_info(read)
+            self.pre_info_reads = set()
+            self.cv.notifyAll()
+            if b"hash" not in info:
+                return None
+            target_info = self.get_target_info_locked()
+
+        deltas = self.apply_deltas(info, target_info)
+        return deltas
+
+    def update(self):
+        request = self.request_update()
+        result = request.result()
+        self.reduce(result)
+
+    def is_alive(self):
+        with self.lock:
+            return bool(self.handles or self.p_to_t_readahead)
+
+    def on_add(self):
+        self.update()
+
+    def on_remove(self):
+        self.update()
+
+    def info_wait(self, callback, inode, timeout):
+        start_time = time.time()
+        while True:
+            need_update = False
+            need_add = False
+
+            with self.cv:
+                while True:
+                    if self.info is None:
+                        need_update = True
+                        break
+                    if b"hash" not in self.info:
+                        need_add = True
+                        break
+                    r = callback(self.info)
+                    if r:
+                        return r
+                    now = time.time()
+                    if now < start_time:
+                        raise llfuse.FUSEError(errno.ETIMEDOUT)
+                    wait = start_time + timeout - now
+                    if wait < 0:
+                        raise llfuse.FUSEError(errno.ETIMEDOUT)
+                    self.cv.wait(wait)
+
+            if need_add:
+                self.add(inode.raw_torrent())
+            if need_update:
+                self.update()
+
+    def wait_for_pieces(self, inode, pieces_callback, timeout):
+        def have_pieces(info):
+            return all(info.have_piece(p) for p in pieces_callback())
+        self.info_wait(have_pieces, inode, timeout)
+
+    def read_piece_request(self, piece, timeout=None):
+        f = concurrent.futures.Future()
+        f.set_running_or_notify_cancel()
+        with self.lock:
+            info = self.info
+            self.read_piece_to_f[piece].add(f)
+        self.client.call("yatfsrpc.read_piece", info[b"hash"], piece)
+        return f
+
+    def on_read_piece(self, piece, data, error):
+        with self.lock:
+            fs = self.read_piece_to_f.pop(piece, [])
+        if error[b"value"]:
+            log().error("Reading piece %s: %s", piece, error)
+        for f in fs:
+            if error[b"value"]:
+                f.set_exception(OSError(errno.EIO, "read piece error"))
+            else:
+                f.set_result(data)
+
+
+class Read(object):
+
+    def __init__(self, handle, offset, size):
+        self.inode = handle.inode
+        self.torrent = handle.torrent
+        self.backend = handle.backend
+        self.offset = offset
+        self.size = size
+        self.time = time.time()
+
+    def file_index(self):
+        return self.inode.file_index()
+
+    def split(self):
+        return self.torrent.piece_split(
+            self.file_index(), self.offset, self.size, 0)
+
+    def pieces(self):
+        return self.torrent.piece_range(
+            self.file_index(), self.offset, self.size, 0)
+
+    def wait(self):
+        self.torrent.wait_for_pieces(
+            self.inode, self.pieces, self.backend.read_timeout)
+
+    def read(self):
+        log().debug("read: %s:%s[%s:%s]", self.torrent.info_hash,
+                self.file_index(), self.offset, self.size)
+        split = self.split()
+        log().debug("split is: %s", split)
+        split = [
+            (self.torrent.read_piece_request(p), lo, hi)
+            for p, lo, hi in split]
+        try:
+            return b"".join(
+                f.result(timeout=self.backend.read_timeout)[lo:hi]
+                for f, lo, hi in split)
+        except concurrent.futures.TimeoutError:
+            raise OSError(errno.ETIMEDOUT, "timeout reading piece")
+
+
+class Handle(fs.TorrentHandle):
+
+    def __init__(self, backend, inode, torrent):
+        super(Handle, self).__init__(backend, inode)
+        self.torrent = torrent
+
+        self.lock = torrent.lock
+        self.reads = weakref.WeakSet()
+
+    def iter_reads(self):
+        for read in list(self.reads):
+            yield read
+
+    def read(self, offset, size):
+        read = Read(self, offset, size)
+        with self.lock:
+            self.reads.add(read)
+
+        self.torrent.add_readahead(read)
+
+        try:
+            read.wait()
+            return read.read()
+        except OSError as e:
+            log().exception(
+                "during read(%s, %s, %s, %s)", self.inode.info_hash(),
+                self.inode.file_index(), offset, size)
+            raise llfuse.FUSEError(e.errno)
+        except:
+            log().exception(
+                "during read(%s, %s, %s, %s)", self.inode.info_hash(),
+                self.inode.file_index(), offset, size)
+            raise llfuse.FUSEError(errno.EIO)
+
+    def release(self):
+        pass
+
+
+def configure_backend(
+        host=None, port=None, username=None, password=None, config_dir=None,
+        timeout=None, **kwargs):
+    client = deluge_client_sync.Client(
+        host=host, port=port, username=username, password=password,
+        config_dir=config_dir, timeout=timeout)
+    return Backend(client, **kwargs)

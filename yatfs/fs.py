@@ -1,252 +1,390 @@
 import errno
+import functools
 import logging
 import os
+import stat
 import sys
+import threading
+import weakref
 
-from yatfs import fusell
-
-
-ROOT_INO = 1
-DEFAULT_ATTR_TIMEOUT = 1
-DEFAULT_ENTRY_TIMEOUT = 1
+import llfuse
 
 
 def log():
     return logging.getLogger(__name__)
 
 
-class TorrentFs(fusell.FUSELL):
+class Inode(object):
 
-    XATTRS = {
-        "user.hash": "t_hash",
-        "user.index": "t_index",
-    }
+    attr_timeout = 1
+    entry_timeout = 1
+    st_mode_type = 0
+    st_mode_perm = 0
 
-    def __init__(self, mountpoint, config, **kwargs):
-        self.config = config
-        self.inodb = self.config.inodb
-        self.backend = self.config.backend
-        super(TorrentFs, self).__init__(
-            mountpoint, fsname=self.config.inodb.path, subtype="yatfs",
-            auto_unmount=True, **kwargs)
+    def __init__(self):
+        self.refcount = 0
+        self.st_ino = None
+        self.st_size = 0
+        self.st_atime_ns = 0
+        self.st_mtime_ns = 0
+        self.st_ctime_ns = 0
 
-    @property
-    def entry_timeout(self):
-        return DEFAULT_ENTRY_TIMEOUT
+    def getattr(self):
+        e = llfuse.EntryAttributes()
+        if self.st_ino is not None:
+            e.st_ino = self.st_ino
+        e.st_mode = (
+            stat.S_IFMT(self.st_mode_type) | stat.S_IMODE(self.st_mode_perm))
+        e.st_size = self.st_size
+        e.st_atime_ns = self.st_atime_ns
+        e.st_mtime_ns = self.st_mtime_ns
+        e.st_ctime_ns = self.st_ctime_ns
+        return e
 
-    @property
-    def attr_timeout(self):
-        return DEFAULT_ATTR_TIMEOUT
+    def access(self, mask):
+        return True
 
-    def init(self, userdata, conn):
-        log().debug("init")
+
+class Symlink(Inode):
+
+    st_mode_type = stat.S_IFLNK
+    st_mode_perm = 0o777
+
+    def readlink(self):
+        raise llfuse.FUSEError(errno.ENOSYS)
+
+
+class StaticSymlink(Symlink):
+
+    def __init__(self, value):
+        super(Symlink, self).__init__()
+        self.value = value
+
+    def readlink(self):
+        return self.value
+
+
+class File(Inode):
+
+    st_mode_type = stat.S_IFREG
+    st_mode_perm = 0o444
+
+    def open(self, flags):
+        return FileHandle(self, flags)
+
+    def read(self, offset, size):
+        raise llfuse.FUSEError(errno.EIO)
+
+
+class TorrentFile(File):
+
+    def __init__(self, backend):
+        super(TorrentFile, self).__init__()
+        self.backend = backend
+
+    def open(self, flags):
+        return self.backend.open(self, flags)
+
+    def info_hash(self):
+        raise NotImplementedError()
+
+    def file_index(self):
+        raise NotImplementedError()
+
+    def raw_torrent(self):
+        raise NotImplementedError()
+
+
+class Data(File):
+
+    def data(self):
+        raise llfuse.FUSEError(errno.EIO)
+
+    def read(self, offset, size):
+        return self.data()[offset:offset + size]
+
+    def getattr(self):
+        e = super(Data, self).getattr()
+        e.st_size = len(self.data())
+        return e
+
+
+class Dir(Inode):
+
+    st_mode_type = stat.S_IFDIR
+    st_mode_perm = 0o555
+
+    def __init__(self):
+        super(Dir, self).__init__()
+        self.cache_lock = threading.RLock()
+        self.cache = weakref.WeakValueDictionary()
+
+    def lookup(self, name):
+        with self.cache_lock:
+            child = self.find(name)
+            if not child:
+                child = self.lookup_create(name)
+                self.cache[name] = child
+        return child
+
+    def lookup_create(self, name):
+        raise llfuse.FUSEError(errno.ENOENT)
+
+    def find(self, name):
+        with self.cache_lock:
+            return self.cache.get(name)
+
+    def opendir(self):
+        return DirHandle(self)
+
+    def readdir(self, offset):
+        return []
+
+
+class StaticDir(Dir):
+
+    def __init__(self):
+        super(StaticDir, self).__init__()
+        self.dirents = {}
+
+    def mkdentry(self, name, inode):
+        self.dirents[name] = inode
+
+    def lookup_create(self, name):
+        inode = self.dirents.get(name)
+        if not inode:
+            raise llfuse.FUSEError(errno.ENOENT)
+        return inode
+
+    def readdir(self, offset):
+        dirents = []
+        for i, (name, inode) in enumerate(sorted(self.dirents.items())):
+            dirents.append((name, inode.getattr(), i + 1))
+        return dirents[offset:]
+
+
+class FileHandle(object):
+
+    def __init__(self, inode, flags):
+        self.inode = inode
+        self.flags = flags
+        self.fh = None
+
+    def read(self, offset, size):
+        return self.inode.read(offset, size)
+
+    def release(self):
+        pass
+
+
+class TorrentHandle(object):
+
+    def __init__(self, backend, inode):
+        self.backend = backend
+        self.inode = inode
+        self.fh = None
+
+    def read(self, offset, size):
+        raise NotImplementedError()
+
+    def release(self):
+        pass
+
+
+class DirHandle(object):
+
+    def __init__(self, inode):
+        self.inode = inode
+        self.fh = None
+
+    def readdir(self, offset):
+        return self.inode.readdir(offset)
+
+    def release(self):
+        pass
+
+
+class Filesystem(object):
+
+    def __init__(self, backend, root):
+        self.backend = backend
+        self.root = root
+
+        self.lock = threading.RLock()
+
+        self.inodes = {}
+        self.handles = {}
+        self._next_ino = llfuse.ROOT_INODE + 1
+        self._next_fh = 0
+
+    def next_ino(self):
+        with self.lock:
+            ino = self._next_ino
+            self._next_ino += 1
+            return ino
+
+    def next_fh(self):
+        with self.lock:
+            fh = self._next_fh
+            self._next_fh += 1
+            return fh
+
+    def inode_require(self, ino):
+        with self.lock:
+            inode = self.inodes.get(ino)
+        if inode is None:
+            raise llfuse.FUSEError(errno.ENOENT)
+        return inode
+
+    def inode_incref(self, inode):
+        with self.lock:
+            if inode.st_ino is None:
+                inode.st_ino = self.next_ino()
+            self.inodes[inode.st_ino] = inode
+            inode.refcount += 1
+
+    def inode_decref(self, inode, n):
+        with self.lock:
+            inode.refcount -= n
+            if inode.refcount <= 0:
+                self.inodes.pop(inode.st_ino)
+
+    def handle_require(self, fh):
+        with self.lock:
+            handle = self.handles.get(fh)
+        if handle is None:
+            raise llfuse.FUSEError(errno.EBADF)
+        return handle
+
+    def handle_add(self, handle):
+        with self.lock:
+            if handle.fh is None:
+                handle.fh = self.next_fh()
+            self.handles[handle.fh] = handle
+
+    def handle_remove(self, handle):
+        with self.lock:
+            self.handles.pop(handle.fh)
+
+    def init(self):
+        self.root.st_ino = llfuse.ROOT_INODE
+        self.inode_incref(self.root)
         self.backend.init()
 
-    def destroy(self, userdata):
-        log().debug("destroy")
+    def destroy(self):
+        with self.lock:
+            handles = list(self.handles.values())
+            for handle in handles:
+                handle.release()
+            self.handles.clear()
+
+            self.inodes.clear()
+
         self.backend.destroy()
 
-    def catch(self, req, context, *args):
-        _, e, _ = sys.exc_info()
-        if context:
-            if e:
-                log().exception(context, *args)
-            else:
-                log().error(context, *args)
-        if e and isinstance(e, OSError):
-            e = e.errno
-        else:
-            e = errno.EIO
-        return self.reply_err(req, e)
 
-    def getattr(self, req, ino, fh):
-        log().debug("getattr(%s)", ino)
-        try:
-            attr = self.inodb.getattr_ino(ino)
-        except:
-            self.catch(req, "getattr(%s)", ino)
-        else:
-            self.reply_attr(req, attr, self.attr_timeout)
+def nolock(f):
+    @functools.wraps(f)
+    def wrapped(*args, **kwargs):
+        with llfuse.lock_released:
+            return f(*args, **kwargs)
+    return wrapped
 
-    def lookup(self, req, parent, name):
-        log().debug("lookup(%s,%s)", parent, name)
-        try:
-            ino = self.inodb.lookup_ino(parent, name)
-            attr = self.inodb.getattr_ino(ino)
-            entry = dict(
-                ino=ino, attr=attr,
-                attr_timeout=self.attr_timeout,
-                entry_timeout=self.entry_timeout)
-        except:
-            self.catch(req, "lookup(%s,%s)", parent, name)
-        else:
-            self.reply_entry(req, entry)
 
-    def setattr(self, req, ino, attr, to_set, fh):
-        log().debug("setattr(%s,%s,%s)", ino, attr, to_set)
-        try:
-            kwargs = {k: getattr(attr, k) for k in to_set}
-            with self.inodb:
-                self.inodb.setattr_ino(ino, **kwargs)
-                attr = self.inodb.getattr_ino(ino)
-        except:
-            self.catch(req, "setattr(%s,%s,%s)", ino, attr, to_set)
-        else:
-            self.reply_attr(req, attr, self.attr_timeout)
+class Operations(llfuse.Operations):
 
-    def mkdir(self, req, parent, name, mode):
-        log().debug("mkdir(%s,%s)", parent, name)
-        try:
-            ctx = self.req_ctx(req)
-            with self.inodb:
-                ino = self.inodb.mkdir_ino(
-                    parent, name, mode, ctx.uid, ctx.gid)
-                attr = self.inodb.getattr_ino(ino)
-                entry = dict(
-                    ino=ino, attr=attr,
-                    attr_timeout=self.attr_timeout,
-                    entry_timeout=self.entry_timeout)
-        except:
-            self.catch(req, "mkdir(%s,%s)", ino, name)
-        else:
-            self.reply_entry(req, entry)
+    def __init__(self, fs):
+        self.fs = fs
 
-    def unlink(self, req, parent, name):
-        log().debug("unlink(%s,%s)", parent, name)
-        try:
-            with self.inodb:
-                self.inodb.unlink_ino(parent, name)
-        except:
-            self.catch(req, "unlink(%s,%s)", parent, name)
-        else:
-            self.reply_err(req, 0)
+    def init(self):
+        self.fs.init()
 
-    def rmdir(self, req, parent, name):
-        log().debug("rmdir(%s,%s)", parent, name)
-        try:
-            with self.inodb:
-                self.inodb.rmdir_ino(parent, name)
-        except:
-            self.catch(req, "rmdir(%s,%s)", parent, name)
-        else:
-            self.reply_err(req, 0)
+    def destroy(self):
+        self.fs.destroy()
 
-    def link(self, req, ino, newparent, newname):
-        log().debug("link(%s,%s,%s)", ino, newparent, newname)
-        try:
-            with self.inodb:
-                self.inodb.link_ino(ino, newparent, newname)
-                attr = self.inodb.getattr_ino(ino)
-                entry = dict(
-                    ino=ino, attr=attr,
-                    attr_timeout=self.attr_timeout,
-                    entry_timeout=self.entry_timeout)
-        except:
-            self.catch(req, "link(%s,%s,%s)", ino, newparent, newname)
-        else:
-            self.reply_entry(req, entry)
+    @nolock
+    def lookup(self, parent, name, ctx):
+        inode = self.fs.inode_require(parent).lookup(name)
+        self.fs.inode_incref(inode)
+        return inode.getattr()
 
-    def readdir(self, req, ino, size, off, fh):
-        log().debug("readdir(%s,%s,%s)", ino, off, size)
-        try:
-            entries = list(self.inodb.readdir_ino(ino))
-        except:
-            self.catch(req, "readdir(%s,%s,%s)", ino, off, size)
-        else:
-            self.reply_readdir(req, size, off, entries)
-
-    def symlink(self, req, link, parent, name):
-        log().debug("symlink(%s,%s,%s)", link, parent, name)
-        try:
-            ctx = self.req_ctx(req)
-            with self.inodb:
-                ino = self.inodb.symlink_ino(
-                    parent, name, link, ctx.uid, ctx.gid)
-            attr = self.inodb.getattr_ino(ino)
-            entry = dict(
-                ino=ino, attr=attr,
-                attr_timeout=self.attr_timeout,
-                entry_timeout=self.entry_timeout)
-        except:
-            self.catch(req, "symlink(%s,%s,%s)", link, parent, name)
-        else:
-            self.reply_entry(req, entry)
-
-    def readlink(self, req, ino):
-        try:
-            link = self.inodb.readlink_ino(ino)
-        except:
-            self.catch(req, "readlink(%s)", ino)
-        else:
-            self.reply_readlink(req, link)
-
-    def listxattr(self, req, ino, size):
-        log().debug("listxattr(%s)", ino)
-        try:
-            attr = self.inodb.getattr_ino(ino)
-        except:
-            self.catch(req, "listxattr(%s)", ino)
-        else:
-            xattrs = []
-            for xattr, key in self.XATTRS.items():
-                if attr.get(key) is not None:
-                    xattrs.append(xattr)
-            self.reply_listxattr(req, xattrs, size)
-
-    def getxattr(self, req, ino, xattr, size):
-        log().debug("getxattr(%s,%s)", ino, xattr)
-        if xattr in self.XATTRS:
-            key = self.XATTRS[xattr]
+    @nolock
+    def forget(self, forgets):
+        for ino, nlookup in forgets:
             try:
-                attr = self.inodb.getattr_ino(ino)
+                inode = self.require_inode(ino)
+                self.fs.inode_decref(inode, nlookup)
             except:
-                self.catch(req, "getxattr(%s,%s)", ino, xattr)
-            else:
-                value = attr.get(key)
-                if value is not None:
-                    if isinstance(value, str):
-                        value = self.encode(value)
-                    elif isinstance(value, (int, float)):
-                        value = self.encode(str(value))
-                    self.reply_xattr(req, value, size)
-                else:
-                    self.reply_err(req, errno.ENODATA)
-        else:
-            self.reply_err(req, errno.ENODATA)
+                log().exception("during forget(%s,%s)", ino, nlookup)
 
-    def ino_to_fid(self, ino):
-        attr = self.inodb.getattr_ino(ino)
-        return (attr["t_hash"], attr["t_index"])
+    @nolock
+    def getattr(self, ino, ctx):
+        return self.fs.inode_require(ino).getattr()
 
-    def open(self, req, ino, fi):
-        log().debug("open(%s)", ino)
+    @nolock
+    def readlink(self, ino, ctx):
+        return self.fs.inode_require(ino).readlink()
+
+    @nolock
+    def open(self, ino, flags, ctx):
+        h = self.fs.inode_require(ino).open(flags)
+        self.fs.handle_add(h)
+        return h.fh
+
+    @nolock
+    def read(self, fh, offset, size):
+        return self.fs.handle_require(fh).read(offset, size)
+
+    @nolock
+    def release(self, fh):
+        h = self.fs.handle_require(fh)
         try:
-            if fi.flags & (os.O_WRONLY | os.O_RDWR):
-                raise OSError(errno.EACCES, "file writing not allowed")
-            hash, idx = self.ino_to_fid(ino)
-            fh = self.backend.open(hash, idx, fi.flags)
-        except:
-            self.catch(req, "open(%s)", ino)
-        else:
-            log().debug("open(%s)=%s", ino, fh)
-            if self.reply_open(req, dict(fh=fh, keep_cache=1)) != 0:
-                self.backend.release(hash, idx, fh)
+            h.release()
+        finally:
+            self.fs.handle_remove(h)
 
-    def release(self, req, ino, fh):
-        log().debug("release(%s(%s))", ino, fh)
-        try:
-            hash, idx = self.ino_to_fid(ino)
-            self.backend.release(hash, idx, fh)
-        except:
-            self.catch(req, "release(%s(%s))", ino, fh)
-        else:
-            self.reply_err(req, 0)
+    @nolock
+    def opendir(self, ino, ctx):
+        h = self.fs.inode_require(ino).opendir()
+        self.fs.handle_add(h)
+        return h.fh
 
-    def read(self, req, ino, size, off, fh):
+    @nolock
+    def readdir(self, fh, offset):
+        h = self.fs.handle_require(fh)
+        for name, entry, next_ in h.readdir(offset):
+            if type(entry) is int:
+                mode = entry
+                entry = llfuse.EntryAttributes()
+                entry.st_mode = mode
+            # Optimization: if we already have an inode for a child, return it
+            # to save a lookup.
+            child = h.inode.find(name)
+            if (child and entry.st_mode == child.st_mode_type and
+                    entry.st_ino != child.st_ino):
+                entry.st_ino = child.st_ino
+            # The kernel treats inode 0 as invalid and ignores it, but any
+            # nonzero inode it hasn't seen yet will trigger a lookup.
+            if not entry.st_ino:
+                entry.st_ino = sys.maxint
+            yield (name, entry, next_)
+
+    @nolock
+    def releasedir(self, fh):
+        h = self.fs.handle_require(fh)
         try:
-            hash, idx = self.ino_to_fid(ino)
-            buf = self.backend.read(hash, idx, off, size, fh)
-        except:
-            self.catch(req, "read(%s(%s),%s,%s)", ino, fh, off, size)
-        else:
-            self.reply_buf(req, buf)
+            h.release()
+        finally:
+            self.fs.handle_remove(h)
+
+    @nolock
+    def statfs(self, ctx):
+        data = llfuse.StatvfsData()
+        data.f_bsize = os.sysconf("SC_PAGE_SIZE")
+        data.f_frsize = os.sysconf("SC_PAGE_SIZE")
+        data.f_namemax = 255
+        return data
+
+    @nolock
+    def access(self, ino, mode, ctx):
+        return self.fs.inode_require(ino).access(mode)
