@@ -1,6 +1,7 @@
 import base64
 import collections
 import errno
+import itertools
 import logging
 import os
 import threading
@@ -171,6 +172,8 @@ class Backend(object):
             for update in torrent.reduce(result):
                 updates.append(update)
 
+            torrent.self_reduce()
+
         try:
             hash_to_info = hash_to_info_request.result()
         except:
@@ -268,11 +271,9 @@ class Torrent(object):
         self.cv = threading.Condition(self.lock)
         self.client = self.backend.client
         self.info = None
-        self.handles = weakref.WeakSet()
-        self.last_released = None
-        self.read_piece_to_f = collections.defaultdict(weakref.WeakSet)
-        self.pre_info_reads = set()
-        self.p_to_t_readahead = {}
+        self.handles = set()
+        self.piece_to_f = {}
+        self.piece_to_read_req = {}
 
     def key_prefix(self):
         return self.backend.key_prefix()
@@ -288,9 +289,15 @@ class Torrent(object):
 
     def iter_reads(self):
         with self.lock:
-            for handle in list(self.handles):
-                for read in list(handle.iter_reads()):
+            for handle in self.handles:
+                for read in handle.iter_reads():
                     yield read
+
+    def reading_pieces(self):
+        return set(p for r in self.iter_reads() for p in r.reading_pieces())
+
+    def readahead_pieces(self):
+        return set(p for r in self.iter_reads() for p in r.readahead_pieces())
 
     def apply_delta(self, key, old, value):
         if key == b"yatfsrpc.sequential_download":
@@ -327,24 +334,25 @@ class Torrent(object):
 
         priority_maps = {}
         for read in self.iter_reads():
-            target_p_to_prio = {}
-            priority = self.backend.reading_priority
-            for p in read.pieces():
+            p_to_prio = {}
+            for p in read.reading_pieces():
                 if self.info.have_piece(p):
                     continue
-                target_p_to_prio[p] = priority
-            id = str(hash(read))
-            key = (self.key_prefix() + id).encode()
-            if target_p_to_prio:
-                priority_maps[key] = target_p_to_prio
-        target_p_to_prio = {}
-        for p in self.p_to_t_readahead.keys():
-            if self.info.have_piece(p):
-                continue
-            target_p_to_prio[p] = self.backend.readahead_priority
-        key = (self.key_prefix() + "readahead").encode()
-        if target_p_to_prio:
-            priority_maps[key] = target_p_to_prio
+                p_to_prio[p] = self.backend.reading_priority
+            read_id = str(id(read))
+            key = (self.key_prefix() + read_id).encode()
+            if p_to_prio:
+                priority_maps[key] = p_to_prio
+
+            p_to_prio = {}
+            for p in read.readahead_pieces():
+                if self.info.have_piece(p):
+                    continue
+                p_to_prio[p] = self.backend.readahead_priority
+            key = (self.key_prefix() + "readahead").encode()
+            if p_to_prio:
+                priority_maps[key] = p_to_prio
+
         target_info[b"yatfsrpc.piece_priority_map"] = priority_maps
 
         priority_maps = {}
@@ -365,6 +373,7 @@ class Torrent(object):
         if self.is_alive():
             target_info[b"paused"] = False
             target_info[b"yatfsrpc.sequential_download"] = True
+
         self.info[b"yatfsrpc.keep_redundant_connections"] = bool(
             self.info[b"yatfsrpc.keep_redundant_connections_map"].get(
                 (self.key_prefix() + "keepalive").encode()))
@@ -373,27 +382,8 @@ class Torrent(object):
         return target_info
 
     def cleanup(self):
-        now = time.time()
         with self.lock:
-            self.p_to_t_readahead= {
-                p: t for p, t in self.p_to_t_readahead.items() if t >= now}
-
-    def add_readahead_with_info(self, read):
-        size_bytes = max(read.size, self.backend.readahead_bytes)
-        size_pieces = self.backend.readahead_pieces
-        pieces = self.piece_range(
-            read.file_index(), read.offset, size_bytes, size_pieces)
-        t = time.time() + self.backend.keepalive
-        with self.lock:
-            self.p_to_t_readahead.update({p: t for p in pieces})
-
-    def add_readahead(self, read):
-        with self.lock:
-            info = self.info
-            if not info:
-                self.pre_info_reads.add(read)
-                return
-        self.add_readahead_with_info(read)
+            self.handles = set(h for h in self.handles if h.is_alive())
 
     def request_update(self):
         return self.client.request(
@@ -415,9 +405,6 @@ class Torrent(object):
 
         with self.lock:
             self.info = info
-            for read in self.pre_info_reads:
-                self.add_readahead_with_info(read)
-            self.pre_info_reads = set()
             self.cv.notifyAll()
             if b"hash" not in info:
                 return None
@@ -426,6 +413,27 @@ class Torrent(object):
         deltas = self.apply_deltas(info, target_info)
         return deltas
 
+    def self_reduce(self):
+        with self.lock:
+            for piece, req in list(self.piece_to_read_req.items()):
+                if req.done():
+                    e = req.exception()
+                    if e:
+                        log().error(
+                            "during read_piece(%s, %s)", self.info_hash,
+                            piece, exc_info=e)
+                        f = self.piece_to_f.get(piece)
+                        if f:
+                            if not f.done():
+                                f.set_exception(e)
+                                del self.piece_to_f[piece]
+                    del self.piece_to_read_req[piece]
+
+            for p in itertools.chain(
+                    self.reading_pieces(), self.readahead_pieces()):
+                if self.info and  self.info.have_piece(p):
+                    self.read_piece_request(p)
+
     def update(self):
         request = self.request_update()
         result = request.result()
@@ -433,7 +441,7 @@ class Torrent(object):
 
     def is_alive(self):
         with self.lock:
-            return bool(self.handles or self.p_to_t_readahead)
+            return bool(self.handles)
 
     def on_add(self):
         self.update()
@@ -476,25 +484,31 @@ class Torrent(object):
             return all(info.have_piece(p) for p in pieces_callback())
         self.info_wait(have_pieces, inode, timeout)
 
-    def read_piece_request(self, piece, timeout=None):
-        f = concurrent.futures.Future()
-        f.set_running_or_notify_cancel()
+    def read_piece_request(self, piece):
         with self.lock:
-            info = self.info
-            self.read_piece_to_f[piece].add(f)
-        self.client.call("yatfsrpc.read_piece", info[b"hash"], piece)
+            f = self.piece_to_f.get(piece)
+            if f:
+                return f
+            f = concurrent.futures.Future()
+            f.set_running_or_notify_cancel()
+            self.piece_to_f[piece] = f
+            self.piece_to_read_req[piece] = self.client.request(
+                "yatfsrpc.read_piece", self.info_hash, piece)
         return f
 
     def on_read_piece(self, piece, data, error):
+        is_error = error[b"value"]
         with self.lock:
-            fs = self.read_piece_to_f.pop(piece, [])
-        if error[b"value"]:
+            f = self.piece_to_f.get(piece)
+            if is_error:
+                self.piece_to_f.pop(piece, None)
+        if not f or f.done():
+            return
+        if is_error:
             log().error("Reading piece %s: %s", piece, error)
-        for f in fs:
-            if error[b"value"]:
-                f.set_exception(OSError(errno.EIO, "read piece error"))
-            else:
-                f.set_result(data)
+            f.set_exception(OSError(errno.EIO, "read piece error"))
+        else:
+            f.set_result(data)
 
 
 class Read(object):
@@ -514,19 +528,22 @@ class Read(object):
         return self.torrent.piece_split(
             self.file_index(), self.offset, self.size, 0)
 
-    def pieces(self):
+    def reading_pieces(self):
         return self.torrent.piece_range(
             self.file_index(), self.offset, self.size, 0)
 
+    def readahead_pieces(self):
+        size_bytes = max(self.size, self.backend.readahead_bytes)
+        size_pieces = self.backend.readahead_pieces
+        return self.torrent.piece_range(
+            self.file_index(), self.offset, size_bytes, size_pieces)
+
     def wait(self):
         self.torrent.wait_for_pieces(
-            self.inode, self.pieces, self.backend.read_timeout)
+            self.inode, self.reading_pieces, self.backend.read_timeout)
 
     def read(self):
-        log().debug("read: %s:%s[%s:%s]", self.torrent.info_hash,
-                self.file_index(), self.offset, self.size)
         split = self.split()
-        log().debug("split is: %s", split)
         split = [
             (self.torrent.read_piece_request(p), lo, hi)
             for p, lo, hi in split]
@@ -546,17 +563,23 @@ class Handle(fs.TorrentHandle):
 
         self.lock = torrent.lock
         self.reads = weakref.WeakSet()
+        self.last_read = None
+        self.live_until = None
 
     def iter_reads(self):
-        for read in list(self.reads):
+        for read in self.reads:
             yield read
+        if self.last_read is not None and self.last_read not in self.reads:
+            yield self.last_read
+
+    def is_alive(self):
+        return self.live_until is None or self.live_until > time.time()
 
     def read(self, offset, size):
         read = Read(self, offset, size)
         with self.lock:
             self.reads.add(read)
-
-        self.torrent.add_readahead(read)
+            self.last_read = read
 
         try:
             read.wait()
@@ -571,9 +594,12 @@ class Handle(fs.TorrentHandle):
                 "during read(%s, %s, %s, %s)", self.inode.info_hash(),
                 self.inode.file_index(), offset, size)
             raise llfuse.FUSEError(errno.EIO)
+        finally:
+            with self.lock:
+                self.reads.remove(read)
 
     def release(self):
-        pass
+        self.live_until = time.time() + self.backend.keepalive
 
 
 def configure_backend(
