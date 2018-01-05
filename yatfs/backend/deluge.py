@@ -303,7 +303,7 @@ class Torrent(object):
         if key == b"paused" and old and not value:
             yield self.client.request(
                 b"core.resume_torrent", [self.info_hash])
-        if key == b"yatfsrpc.keep_redundant_connections_map":
+        if key == b"yatfsrpc.keep_redundant_connections":
             key = self.key_prefix() + "keepalive"
             if value:
                 kwargs = {"update": {key: value}}
