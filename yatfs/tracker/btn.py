@@ -232,7 +232,7 @@ class SeriesName(SeriesMetadata):
     def data(self):
         r = self.api.db.cursor().execute(
             "select name from series where id = ?", (self.id,)).fetchone()
-        return r[0].encode() if r else b""
+        return r[0].encode() if r and r[0] else b""
 
 
 class SeriesTvdbId(SeriesMetadata):
@@ -240,7 +240,7 @@ class SeriesTvdbId(SeriesMetadata):
     def data(self):
         r = self.api.db.cursor().execute(
             "select tvdb_id from series where id = ?", (self.id,)).fetchone()
-        return str(r[0]).encode() if r else b""
+        return str(r[0]).encode() if r and r[0] else b""
 
 
 class SeriesImdbId(SeriesMetadata):
@@ -256,7 +256,7 @@ class SeriesBanner(SeriesMetadata):
     def data(self):
         r = self.api.db.cursor().execute(
             "select banner from series where id = ?", (self.id,)).fetchone()
-        return r[0].encode() if r else b""
+        return r[0].encode() if r and r[0] else b""
 
 
 class SeriesPoster(SeriesMetadata):
@@ -264,7 +264,7 @@ class SeriesPoster(SeriesMetadata):
     def data(self):
         r = self.api.db.cursor().execute(
             "select poster from series where id = ?", (self.id,)).fetchone()
-        return r[0].encode() if r else b""
+        return r[0].encode() if r and r[0] else b""
 
 
 class SeriesYoutubeTrailer(SeriesMetadata):
@@ -273,7 +273,7 @@ class SeriesYoutubeTrailer(SeriesMetadata):
         r = self.api.db.cursor().execute(
             "select youtube_trailer from series where id = ?",
             (self.id,)).fetchone()
-        return r[0].encode() if r else b""
+        return r[0].encode() if r and r[0] else b""
 
 
 class SeriesGroupContainer(yatfs_fs.StaticDir):
@@ -391,7 +391,7 @@ class GroupCategory(GroupMetadata):
             "select category.name from torrent_entry_group inner join "
             "category on torrent_entry_group.category_id = category.id "
             "where torrent_entry_group.id = ?", (self.id,)).fetchone()
-        return r[0].encode() if r else b""
+        return r[0].encode() if r and r[0] else b""
 
 
 class GroupName(GroupMetadata):
@@ -400,7 +400,7 @@ class GroupName(GroupMetadata):
         r = self.api.db.cursor().execute(
             "select name from torrent_entry_group where id = ?",
             (self.id,)).fetchone()
-        return r[0].encode() if r else b""
+        return r[0].encode() if r and r[0] else b""
 
 
 class GroupTorrentContainer(yatfs_fs.StaticDir):
@@ -620,7 +620,7 @@ class TorrentReleaseName(TorrentMetadata):
         r = self.api.db.cursor().execute(
             "select release_name from torrent_entry where id = ?",
             (self.id,)).fetchone()
-        return r[0].encode() if r else b""
+        return r[0].encode() if r and r[0] else b""
 
 
 class TorrentDataContainer(yatfs_fs.StaticDir):
