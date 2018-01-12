@@ -415,6 +415,8 @@ class Torrent(object):
 
     def self_reduce(self):
         with self.lock:
+            if not self.info:
+                return
             for piece, req in list(self.piece_to_read_req.items()):
                 if req.done():
                     e = req.exception()
@@ -431,7 +433,7 @@ class Torrent(object):
 
             for p in itertools.chain(
                     self.reading_pieces(), self.readahead_pieces()):
-                if self.info and  self.info.have_piece(p):
+                if self.info.have_piece(p):
                     self.read_piece_request(p)
 
     def update(self):
@@ -567,13 +569,15 @@ class Handle(fs.TorrentHandle):
         self.live_until = None
 
     def iter_reads(self):
-        for read in self.reads:
-            yield read
-        if self.last_read is not None and self.last_read not in self.reads:
-            yield self.last_read
+        with self.lock:
+            for read in self.reads:
+                yield read
+            if self.last_read is not None and self.last_read not in self.reads:
+                yield self.last_read
 
     def is_alive(self):
-        return self.live_until is None or self.live_until > time.time()
+        with self.lock:
+            return self.live_until is None or self.live_until > time.time()
 
     def read(self, offset, size):
         read = Read(self, offset, size)
@@ -582,6 +586,7 @@ class Handle(fs.TorrentHandle):
             self.last_read = read
 
         try:
+            self.torrent.self_reduce()
             read.wait()
             return read.read()
         except OSError as e:
@@ -599,7 +604,8 @@ class Handle(fs.TorrentHandle):
                 self.reads.remove(read)
 
     def release(self):
-        self.live_until = time.time() + self.backend.keepalive
+        with self.lock:
+            self.live_until = time.time() + self.backend.keepalive
 
 
 def configure_backend(
