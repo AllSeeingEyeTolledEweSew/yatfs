@@ -205,7 +205,7 @@ class Series(yatfs_fs.StaticDir):
 
     def __init__(self, api, id):
         super(Series, self).__init__()
-        self.mkdentry(b"group", SeriesGroupContainer(api, id))
+        self.mkdentry(b"group", SeriesGroupByNameContainer(api, id))
         self.mkdentry(b"name", SeriesName(api, id))
         self.mkdentry(b"imdb_id", SeriesImdbId(api, id))
         self.mkdentry(b"tvdb_id", SeriesTvdbId(api, id))
@@ -276,13 +276,6 @@ class SeriesYoutubeTrailer(SeriesMetadata):
         return r[0].encode() if r and r[0] else b""
 
 
-class SeriesGroupContainer(yatfs_fs.StaticDir):
-
-    def __init__(self, api, id):
-        super(SeriesGroupContainer, self).__init__()
-        self.mkdentry(b"by-name", SeriesGroupByNameContainer(api, id))
-
-
 class SeriesGroupByNameContainer(yatfs_fs.Dir):
 
     def __init__(self, api, id):
@@ -319,7 +312,7 @@ class SeriesGroupByNameContainer(yatfs_fs.Dir):
                 continue
             id = r[0]
             link = yatfs_fs.StaticSymlink(
-                ("../../../../../group/by-id/%d" % id).encode())
+                ("../../../../group/by-id/%d" % id).encode())
             link.entry_timeout = 3600
             link.attr_timeout = 86400
             return link
@@ -369,7 +362,7 @@ class Group(yatfs_fs.StaticDir):
 
     def __init__(self, api, id, series_id):
         super(Group, self).__init__()
-        self.mkdentry(b"torrent", GroupTorrentContainer(api, id))
+        self.mkdentry(b"torrent", GroupTorrentByKey(api, id))
         self.mkdentry(b"series", yatfs_fs.StaticSymlink(
             ("../../../series/by-id/%s" % series_id).encode()))
         self.mkdentry(b"category", GroupCategory(api, id))
@@ -401,13 +394,6 @@ class GroupName(GroupMetadata):
             "select name from torrent_entry_group where id = ?",
             (self.id,)).fetchone()
         return r[0].encode() if r and r[0] else b""
-
-
-class GroupTorrentContainer(yatfs_fs.StaticDir):
-
-    def __init__(self, api, id):
-        super(GroupTorrentContainer, self).__init__()
-        self.mkdentry(b"by-key", GroupTorrentByKey(api, id))
 
 
 class GroupTorrentByKey(yatfs_fs.Dir):
@@ -464,7 +450,7 @@ class GroupTorrentByKey(yatfs_fs.Dir):
         if (not r) or r[0] != self.id:
             raise llfuse.FUSEError(errno.ENOENT)
         link = yatfs_fs.StaticSymlink(
-            ("../../../../../torrent/by-id/%d" % id).encode())
+            ("../../../../torrent/by-id/%d" % id).encode())
         link.entry_timeout = 3600
         link.attr_timeout = 86400
         apply_attr(link, self.api, id)
