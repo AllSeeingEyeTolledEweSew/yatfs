@@ -10,6 +10,18 @@ import weakref
 import llfuse
 
 
+class NoopLock(object):
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+llfuse.lock = NoopLock()
+
+
 def log():
     return logging.getLogger(__name__)
 
@@ -283,14 +295,6 @@ class Filesystem(object):
         self.backend.destroy()
 
 
-def nolock(f):
-    @functools.wraps(f)
-    def wrapped(*args, **kwargs):
-        with llfuse.lock_released:
-            return f(*args, **kwargs)
-    return wrapped
-
-
 class Operations(llfuse.Operations):
 
     def __init__(self, fs):
@@ -302,13 +306,11 @@ class Operations(llfuse.Operations):
     def destroy(self):
         self.fs.destroy()
 
-    @nolock
     def lookup(self, parent, name, ctx):
         inode = self.fs.inode_require(parent).lookup(name)
         self.fs.inode_incref(inode)
         return inode.getattr()
 
-    @nolock
     def forget(self, forgets):
         for ino, nlookup in forgets:
             try:
@@ -317,25 +319,20 @@ class Operations(llfuse.Operations):
             except:
                 log().exception("during forget(%s,%s)", ino, nlookup)
 
-    @nolock
     def getattr(self, ino, ctx):
         return self.fs.inode_require(ino).getattr()
 
-    @nolock
     def readlink(self, ino, ctx):
         return self.fs.inode_require(ino).readlink()
 
-    @nolock
     def open(self, ino, flags, ctx):
         h = self.fs.inode_require(ino).open(flags)
         self.fs.handle_add(h)
         return h.fh
 
-    @nolock
     def read(self, fh, offset, size):
         return self.fs.handle_require(fh).read(offset, size)
 
-    @nolock
     def release(self, fh):
         h = self.fs.handle_require(fh)
         try:
@@ -343,13 +340,11 @@ class Operations(llfuse.Operations):
         finally:
             self.fs.handle_remove(h)
 
-    @nolock
     def opendir(self, ino, ctx):
         h = self.fs.inode_require(ino).opendir()
         self.fs.handle_add(h)
         return h.fh
 
-    @nolock
     def readdir(self, fh, offset):
         h = self.fs.handle_require(fh)
         for name, entry, next_ in h.readdir(offset):
@@ -369,7 +364,6 @@ class Operations(llfuse.Operations):
                 entry.st_ino = sys.maxint
             yield (name, entry, next_)
 
-    @nolock
     def releasedir(self, fh):
         h = self.fs.handle_require(fh)
         try:
@@ -377,7 +371,6 @@ class Operations(llfuse.Operations):
         finally:
             self.fs.handle_remove(h)
 
-    @nolock
     def statfs(self, ctx):
         data = llfuse.StatvfsData()
         data.f_bsize = os.sysconf("SC_PAGE_SIZE")
@@ -385,6 +378,5 @@ class Operations(llfuse.Operations):
         data.f_namemax = 255
         return data
 
-    @nolock
     def access(self, ino, mode, ctx):
         return self.fs.inode_require(ino).access(mode)
