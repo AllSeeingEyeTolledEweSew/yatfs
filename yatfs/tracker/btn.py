@@ -47,6 +47,44 @@ class Tracker(yatfs_fs.StaticDir):
         self.mkdentry(b"series", SeriesContainer(api))
         self.mkdentry(b"group", GroupContainer(api))
         self.mkdentry(b"torrent", TorrentContainer(backend, api))
+        self.mkdentry(b"browse", BrowseContainer(api))
+
+
+class BrowseContainer(yatfs_fs.Dir):
+
+    def __init__(self, api):
+        super(BrowseContainer, self).__init__()
+        self.api = api
+
+    def readdir(self, offset):
+        if offset == 0:
+            offset = -1
+        c = self.api.db.cursor()
+        c.execute(
+            "select id, name from series where id > ? and not deleted "
+            "order by id", (offset,))
+        for id, name in c:
+            if not name:
+                continue
+            name = name.replace("/", "_")
+            yield (name.encode(), stat.S_IFDIR, id)
+
+    def lookup_create(self, name):
+        try:
+            name = name.decode()
+        except UnicodeDecodeError:
+            raise llfuse.FUSEError(errno.ENOENT)
+        for name in slash_variations(name):
+            c = self.api.db.cursor()
+            r = c.execute(
+                "select id from series where name = ? and not deleted",
+                (name,)).fetchone()
+            if not r:
+                continue
+            id = r[0]
+            return SeriesBrowseContainer(self.api, id)
+        else:
+            raise llfuse.FUSEError(errno.ENOENT)
 
 
 class SeriesContainer(yatfs_fs.StaticDir):
@@ -316,6 +354,46 @@ class SeriesGroupByNameContainer(yatfs_fs.Dir):
             link.entry_timeout = 3600
             link.attr_timeout = 86400
             return link
+        else:
+            raise llfuse.FUSEError(errno.ENOENT)
+
+
+class SeriesBrowseContainer(yatfs_fs.Dir):
+
+    def __init__(self, api, id):
+        super(SeriesBrowseContainer, self).__init__()
+        self.api = api
+        self.id = id
+
+    def readdir(self, offset):
+        if offset == 0:
+            offset = -1
+        c = self.api.db.cursor()
+        c.execute(
+            "select id, name from torrent_entry_group "
+            "where id > ? and series_id = ? and not deleted order by id",
+            (offset, self.id))
+        for id, name in c:
+            if not name:
+                continue
+            name = name.replace("/", "_")
+            yield (name.encode(), stat.S_IFLNK, id)
+
+    def lookup_create(self, name):
+        try:
+            name = name.decode()
+        except UnicodeDecodeError:
+            raise llfuse.FUSEError(errno.ENOENT)
+        for name in slash_variations(name):
+            c = self.api.db.cursor()
+            r = c.execute(
+                "select id from torrent_entry_group "
+                "where name = ? and series_id = ? and not deleted",
+                (name, self.id)).fetchone()
+            if not r:
+                continue
+            id = r[0]
+            return GroupBrowseSubdir(self.api, id, b"")
         else:
             raise llfuse.FUSEError(errno.ENOENT)
 
@@ -769,6 +847,93 @@ class TorrentFile(yatfs_fs.TorrentFile):
         e.st_size = r[0]
         apply_attr(e, self.api, self.id)
         return e
+
+
+class GroupBrowseSubdir(yatfs_fs.Dir):
+
+    def __init__(self, api, id, prefix):
+        super(GroupBrowseSubdir, self).__init__()
+        self.api = api
+        self.id = id
+        self.prefix = prefix
+
+    def readdir(self, offset):
+        c = self.api.db.cursor()
+        if not self.prefix:
+            strip = 0
+            c.execute(
+                "select file_info.path from file_info "
+                "inner join torrent_entry "
+                "where file_info.id = torrent_entry.id and "
+                "not torrent_entry.deleted and "
+                "torrent_entry.group_id = ? "
+                "order by file_info.path limit -1 offset ?", (self.id, offset))
+        else:
+            strip = len(self.prefix) + 1
+            lo = self.prefix + b"/"
+            hi = self.prefix + b"0"
+            c.execute(
+                "select file_info.path from file_info "
+                "inner join torrent_entry "
+                "where file_info.id = torrent_entry.id and "
+                "not torrent_entry.deleted and "
+                "torrent_entry.group_id = ? "
+                "and file_info.path > ? and file_info.path < ? "
+                "order by file_info.path "
+                "limit -1 offset ?", (self.id, lo, hi, offset))
+        prev_name, prev_type = (None, None)
+        index = 0
+        for index, (path,) in enumerate(c):
+            tail = path[strip:].split(b"/")
+            name = tail[0]
+            if name != prev_name and prev_name is not None:
+                yield (prev_name, prev_type, index + offset)
+            if len(tail) == 1:
+                type = stat.S_IFREG
+            else:
+                type = stat.S_IFDIR
+            prev_name = name
+            prev_type = type
+        if prev_name is not None:
+            yield (prev_name, prev_type, index + offset + 1)
+
+    def lookup_create(self, name):
+        if self.prefix:
+            path = self.prefix + b"/" + name
+        else:
+            path = name
+        c = self.api.db.cursor()
+        r = c.execute(
+            "select file_info.id, file_info.file_index from file_info "
+            "inner join torrent_entry "
+            "where file_info.id = torrent_entry.id and "
+            "not torrent_entry.deleted and "
+            "torrent_entry.group_id = ? "
+            "and file_info.path = ?", (self.id, path,)).fetchone()
+        if r:
+            torrent_entry_id, file_index, = r
+            count = path.count(b"/")
+            path = (
+                "".join(["../"] * count) +
+                "../../../torrent/by-id/%s/data/by-index/%s" % (
+                    torrent_entry_id, file_index))
+            link = yatfs_fs.StaticSymlink(path.encode())
+            apply_attr(link, self.api, torrent_entry_id)
+            return link
+        lo = path + b"/"
+        hi = path + b"0"
+        c = self.api.db.cursor()
+        r = c.execute(
+            "select count(*) from file_info inner join torrent_entry "
+            "where file_info.id = torrent_entry.id and "
+            "not torrent_entry.deleted and "
+            "torrent_entry.group_id = ? "
+            "and file_info.path > ? and file_info.path < ?",
+            (self.id, lo, hi)).fetchone()
+        count, = r
+        if count:
+            return GroupBrowseSubdir(self.api, self.id, path)
+        raise llfuse.FUSEError(errno.ENOENT)
 
 
 def configure_root(backend, **kwargs):
