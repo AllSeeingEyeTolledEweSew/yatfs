@@ -314,7 +314,7 @@ class Operations(llfuse.Operations):
     def forget(self, forgets):
         for ino, nlookup in forgets:
             try:
-                inode = self.inode_require(ino)
+                inode = self.fs.inode_require(ino)
                 self.fs.inode_decref(inode, nlookup)
             except:
                 log().exception("during forget(%s,%s)", ino, nlookup)
