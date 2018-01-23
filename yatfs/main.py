@@ -42,44 +42,52 @@ def comma_separated_map(string):
     return d
 
 
-def parse_args():
+def create_parser():
     parser = argparse.ArgumentParser(
         description="Yet Another Torrent Filesystem")
 
     parser.add_argument("mountpoint")
     parser.add_argument(
         "--debug", action="store_true", help="Enable debugging output")
-    parser.add_argument(
-        "--fuse_options", type=comma_separated_list, help="FUSE options")
 
     parser.add_argument(
         "--backend", choices=(BACKEND_DELUGE, BACKEND_NOOP))
-    parser.add_argument(
-        "--backend_options", type=comma_separated_map, help="Backend options")
 
-    parser.add_argument(
-        "--tracker", choices=(TRACKER_BTN,))
-    parser.add_argument(
-        "--tracker_options", type=comma_separated_map, help="Tracker options")
+    fuse_group = parser.add_argument_group("FUSE options")
+    fuse_group.add_argument(
+        "--fuse_options", type=comma_separated_list)
+    fuse_group.add_argument("--num_workers", type=int, default=64)
 
-    parser.add_argument("--num_workers", type=int, default=64)
+    io_group = parser.add_argument_group("I/O options")
+    io_group.add_argument(
+        "--read_timeout", type=int, default=60)
+    io_group.add_argument(
+        "--keepalive", type=int, default=60)
+    io_group.add_argument(
+        "--readahead_pieces", type=int, default=4)
+    io_group.add_argument(
+        "--readahead_bytes", type=int, default=0x2000000)
 
-    args = parser.parse_args()
+    backend_deluge.add_arguments(parser)
+
+    tracker_btn.add_arguments(parser)
+
+    return parser
 
 
-    return args
-
-
-def configure_backend(args):
+def configure_backend(parser, args):
     if args.backend == BACKEND_DELUGE:
-        return backend_deluge.configure_backend(**args.backend_options)
+        return backend_deluge.configure(parser, args)
     if args.backend == BACKEND_NOOP:
         return backend_noop.Backend()
 
 
-def configure_root(args, backend):
-    if args.tracker == TRACKER_BTN:
-        return tracker_btn.configure_root(backend, **args.tracker_options)
+def configure_root(parser, args, backend):
+    root = yatfs_fs.StaticDir()
+    btn_root = tracker_btn.configure(parser, args, backend)
+    if btn_root is not None:
+        root.mkdentry(b"btn", btn_root)
+    return root
 
 
 def configure_fuse_options(args):
@@ -89,7 +97,8 @@ def configure_fuse_options(args):
 
 
 def main():
-    args = parse_args()
+    parser = create_parser()
+    args = parser.parse_args()
 
     if args.debug:
         level = logging.DEBUG
@@ -100,8 +109,8 @@ def main():
         format="%(asctime)s %(levelname)s %(threadName)s "
         "%(filename)s:%(lineno)d %(message)s")
 
-    backend = configure_backend(args)
-    root = configure_root(args, backend)
+    backend = configure_backend(parser, args)
+    root = configure_root(parser, args, backend)
     fs = yatfs_fs.Filesystem(backend, root)
     ops = yatfs_fs.Operations(fs)
     fuse_options = configure_fuse_options(args)

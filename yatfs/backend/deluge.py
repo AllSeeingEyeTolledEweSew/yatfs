@@ -16,15 +16,6 @@ import deluge_client_sync
 from yatfs import fs
 
 
-DEFAULT_KEY = "yatfs"
-DEFAULT_KEEPALIVE = 60
-DEFAULT_READ_TIMEOUT = 60
-DEFAULT_READAHEAD_PIECES = 4
-DEFAULT_READAHEAD_BYTES = 0x2000000
-DEFAULT_READAHEAD_PRIORITY = 4
-DEFAULT_READING_PRIORITY = 7
-
-
 def log():
     return logging.getLogger(__name__)
 
@@ -75,21 +66,29 @@ class Info(dict):
 
 class Backend(object):
 
+    DEFAULT_KEY = "yatfs"
+    DEFAULT_KEEPALIVE = 60
+    DEFAULT_READ_TIMEOUT = 60
+    DEFAULT_READAHEAD_PIECES = 4
+    DEFAULT_READAHEAD_BYTES = 0x2000000
+    DEFAULT_READAHEAD_PRIORITY = 4
+    DEFAULT_READING_PRIORITY = 7
+
     def __init__(self, client, key=None, keepalive=None, read_timeout=None,
                  readahead_pieces=None, readahead_bytes=None,
                  readahead_priority=None, reading_priority=None):
         self.client = client
-        self.keepalive = float(keepalive or DEFAULT_KEEPALIVE)
-        self.read_timeout = float(read_timeout or DEFAULT_READ_TIMEOUT)
+        self.keepalive = float(keepalive or self.DEFAULT_KEEPALIVE)
+        self.read_timeout = float(read_timeout or self.DEFAULT_READ_TIMEOUT)
         self.readahead_pieces = int(
-            readahead_pieces or DEFAULT_READAHEAD_PIECES)
+            readahead_pieces or self.DEFAULT_READAHEAD_PIECES)
         self.readahead_bytes = int(
-            readahead_bytes or DEFAULT_READAHEAD_BYTES)
-        self.key = key or DEFAULT_KEY
+            readahead_bytes or self.DEFAULT_READAHEAD_BYTES)
+        self.key = key or self.DEFAULT_KEY
         self.readahead_priority = int(
-            readahead_priority or DEFAULT_READAHEAD_PRIORITY)
+            readahead_priority or self.DEFAULT_READAHEAD_PRIORITY)
         self.reading_priority = int(
-            reading_priority or DEFAULT_READING_PRIORITY)
+            reading_priority or self.DEFAULT_READING_PRIORITY)
 
         self.lock = threading.RLock()
         self.torrents = {}
@@ -608,10 +607,26 @@ class Handle(fs.TorrentHandle):
             self.live_until = time.time() + self.backend.keepalive
 
 
-def configure_backend(
-        host=None, port=None, username=None, password=None, config_dir=None,
-        timeout=None, **kwargs):
-    client = deluge_client_sync.Client(
-        host=host, port=port, username=username, password=password,
-        config_dir=config_dir, timeout=timeout)
-    return Backend(client, **kwargs)
+def add_arguments(parser):
+    group = parser.add_argument_group("Deluge backend options")
+    deluge_client_sync.add_arguments(group, create_group=False)
+
+    group.add_argument(
+        "--deluge_yatfs_key", type=str, default=Backend.DEFAULT_KEY)
+    group.add_argument(
+        "--deluge_yatfs_reading_priority", type=int,
+        default=Backend.DEFAULT_READING_PRIORITY, choices=range(1, 8))
+    group.add_argument(
+        "--deluge_yatfs_readahead_priority", type=int,
+        default=Backend.DEFAULT_READAHEAD_PRIORITY, choices=range(1, 8))
+
+
+def configure(parser, args):
+    client = deluge_client_sync.Client.from_args(parser, args)
+    return Backend(
+        client, key=args.deluge_yatfs_key,
+        reading_priority=args.deluge_yatfs_reading_priority,
+        readahead_priority=args.deluge_yatfs_readahead_priority,
+        keepalive=args.keepalive, read_timeout=args.read_timeout,
+        readahead_pieces=args.readahead_pieces,
+        readahead_bytes=args.readahead_bytes)

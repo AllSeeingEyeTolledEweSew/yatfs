@@ -936,6 +936,10 @@ class GroupBrowseSubdir(yatfs_fs.Dir):
         raise llfuse.FUSEError(errno.ENOENT)
 
 
-def configure_root(backend, **kwargs):
-    api = btn_lib.API(**kwargs)
+def add_arguments(parser):
+    btn_lib.add_arguments(parser)
+
+
+def configure(parser, args, backend):
+    api = btn_lib.API.from_args(parser, args)
     return Tracker(backend, api)
