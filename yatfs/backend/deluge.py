@@ -12,6 +12,7 @@ import better_bencode
 import concurrent.futures
 import llfuse
 
+import btn
 import deluge_client_sync
 from yatfs import fs
 
@@ -53,6 +54,21 @@ def file_range_split(info, idx, offset, size):
             hi = piece_length
         split.append((p, lo, hi))
     return split
+
+
+def should_force_full_download(info):
+    for r in btn.TRACKER_REGEXES:
+        if r.match(info[b"tracker"].decode()):
+            break
+    else:
+        return False
+    if info[b"total_done"] >= info[b"total_size"]:
+        return False
+    downloaded_fraction = (
+        float(info[b"all_time_download"]) / info[b"total_size"])
+    if downloaded_fraction < 0.1:
+        return False
+    return True
 
 
 class Info(dict):
@@ -155,7 +171,9 @@ class Backend(object):
         hash_to_info_request = self.client.request(
             "core.get_torrents_status", {}, (
                 "yatfsrpc.piece_priority_map",
-                "yatfsrpc.keep_redundant_connections_map"))
+                "yatfsrpc.keep_redundant_connections_map",
+                "tracker", "total_done", "total_size", "file_priorities",
+                "all_time_download"))
 
         updates = []
 
@@ -211,6 +229,12 @@ class Backend(object):
                 yield self.client.request(
                     "yatfsrpc.update_keep_redundant_connections_map",
                     info_hash, delete=delete_k_ks)
+            if should_force_full_download(info):
+                priorities = info[b"file_priorities"]
+                if any(p == 0 for p in priorities):
+                    yield self.client.request(
+                        "core.set_torrent_file_priorities", info_hash,
+                        [1 if p == 0 else p for p in priorities])
 
     def updater(self, shutdown):
         log().debug("start")
@@ -260,7 +284,9 @@ class Torrent(object):
               b"save_path", b"hash", b"num_pieces",
               b"yatfsrpc.sequential_download",
               b"yatfsrpc.piece_priority_map", b"state",
-              b"yatfsrpc.keep_redundant_connections_map")
+              b"yatfsrpc.keep_redundant_connections_map",
+              b"tracker", b"total_done", b"total_size", b"all_time_download",
+              b"file_priorities")
 
     def __init__(self, backend, info_hash):
         self.backend = backend
@@ -318,6 +344,11 @@ class Torrent(object):
             yield self.client.request(
                 b"yatfsrpc.update_keep_redundant_connections_map",
                 self.info_hash, **kwargs)
+        if key == b"file_priorities":
+            yield self.client.request(
+                b"core.set_torrent_file_priorities", self.info_hash, value)
+            yield self.client.request(
+                b"yatfsrpc.update_piece_priority_map", self.info_hash)
 
     def apply_deltas(self, info, target_info):
         changes = []
@@ -353,6 +384,11 @@ class Torrent(object):
                 priority_maps[key] = p_to_prio
 
         target_info[b"yatfsrpc.piece_priority_map"] = priority_maps
+
+        target_info[b"file_priorities"] = self.info[b"file_priorities"]
+        if should_force_full_download(self.info):
+            target_info[b"file_priorities"] = tuple(
+                1 if p == 0 else p for p in self.info[b"file_priorities"])
 
         priority_maps = {}
         for k, p_to_prio in self.info[b"yatfsrpc.piece_priority_map"].items():
