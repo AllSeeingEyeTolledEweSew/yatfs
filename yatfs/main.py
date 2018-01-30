@@ -47,8 +47,7 @@ def create_parser():
         description="Yet Another Torrent Filesystem")
 
     parser.add_argument("mountpoint")
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debugging output")
+    parser.add_argument("--verbose", "-v", action="count")
 
     parser.add_argument(
         "--backend", choices=(BACKEND_DELUGE, BACKEND_NOOP))
@@ -100,7 +99,7 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
-    if args.debug:
+    if args.verbose:
         level = logging.DEBUG
     else:
         level = logging.INFO
