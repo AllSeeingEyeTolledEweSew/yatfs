@@ -655,7 +655,7 @@ class TorrentSeeders(TorrentMetadata):
 
     def data(self):
         r = self.api.db.cursor().execute(
-            "select seeders from torrent_entry where id = ?",
+            "select seeders from tracker_stats where id = ?",
             (self.id,)).fetchone()
         return str(r[0]).encode() if r else b""
 
@@ -664,7 +664,7 @@ class TorrentLeechers(TorrentMetadata):
 
     def data(self):
         r = self.api.db.cursor().execute(
-            "select leechers from torrent_entry where id = ?",
+            "select leechers from tracker_stats where id = ?",
             (self.id,)).fetchone()
         return str(r[0]).encode() if r else b""
 
