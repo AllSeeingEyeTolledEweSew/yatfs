@@ -24,10 +24,23 @@ setup(
         ]
     },
     install_requires=[
-        "deluge-client-sync>=0.1.0",
+        "deluge-client-sync>=1.0.0",
         "better-bencode>=0.2.1",
         "PyYAML>=3.12",
 	"llfuse>=1.3,<2.0",
-	"btn>=0.1.2",
+	"btn>=1.0.0",
+    ],
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: End Users/Desktop",
+        "License :: Public Domain",
+        "Programming Language :: Python",
+        "Topic :: Communications :: File Sharing",
+        "Topic :: System :: Filesystems",
+        "Topic :: System :: Networking",
+        "Operating System :: POSIX :: Linux",
+        "Operating System :: MacOS :: MacOS X",
+        "Operating System :: POSIX :: BSD :: FreeBSD",
+        "License :: Public Domain",
     ],
 )
