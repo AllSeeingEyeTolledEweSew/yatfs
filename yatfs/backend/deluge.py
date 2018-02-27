@@ -442,7 +442,7 @@ class Torrent(object):
             self.info = info
             self.cv.notifyAll()
             if b"hash" not in info:
-                return None
+                return []
             target_info = self.get_target_info_locked()
 
         deltas = self.apply_deltas(info, target_info)
