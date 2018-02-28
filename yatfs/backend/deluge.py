@@ -628,7 +628,7 @@ class Handle(fs.TorrentHandle):
             log().exception(
                 "during read(%s, %s, %s, %s)", self.inode.info_hash(),
                 self.inode.file_index(), offset, size)
-            raise llfuse.FUSEError(e.errno)
+            raise llfuse.FUSEError(e.errno or errno.EIO)
         except:
             log().exception(
                 "during read(%s, %s, %s, %s)", self.inode.info_hash(),
